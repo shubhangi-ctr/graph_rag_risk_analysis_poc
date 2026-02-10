@@ -1,6 +1,12 @@
 """
 Combined RAG Application - Graph RAG vs Traditional RAG Side-by-Side Comparison
 """
+from traditional_rag import query_engine as trad_query_engine
+from traditional_rag.vector_store import ChromaVectorStore, build_rag_documents
+from graph_rag import query_engine as graph_query_engine
+from graph_rag.graph_loader import GraphLoader, load_to_neo4j
+import config
+from excel_parser import parse_excel, ParsedData
 import streamlit as st
 import streamlit.components.v1 as components
 import os
@@ -14,14 +20,6 @@ import io
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from excel_parser import parse_excel, ParsedData
-import config
-
-from graph_rag.graph_loader import GraphLoader, load_to_neo4j
-from graph_rag import query_engine as graph_query_engine
-
-from traditional_rag.vector_store import ChromaVectorStore, build_rag_documents
-from traditional_rag import query_engine as trad_query_engine
 
 st.set_page_config(
     page_title=config.APP_TITLE,
@@ -93,26 +91,26 @@ def create_neo4j_style_graph(nodes: List[Dict], relationships: List[Dict], heigh
     nodes_data = {}
     vis_nodes = []
     added_nodes = set()
-    
+
     for node in nodes:
         node_id = str(node.get('id', ''))
         if not node_id or node_id in added_nodes:
             continue
-            
+
         label = str(node.get('label', node.get('name', node_id)))
         node_type = node.get('type', 'Unknown')
         color = NODE_COLORS.get(node_type, '#999999')
         size = NODE_SIZES.get(node_type, 20)
-        
+
         display_label = label[:20] + '...' if len(label) > 25 else label
-        
+
         nodes_data[node_id] = {
             'id': node_id,
             'type': node_type,
             'label': label,
             **{k: v for k, v in node.items() if k not in ['id', 'type', 'label']}
         }
-        
+
         vis_nodes.append({
             'id': node_id,
             'label': display_label,
@@ -129,7 +127,7 @@ def create_neo4j_style_graph(nodes: List[Dict], relationships: List[Dict], heigh
         source = str(rel.get('source', ''))
         target = str(rel.get('target', ''))
         rel_type = rel.get('type', 'RELATED')
-        
+
         edge_key = f"{source}-{rel_type}-{target}"
         if source in added_nodes and target in added_nodes and edge_key not in added_edges:
             vis_edges.append({
@@ -244,20 +242,23 @@ def create_neo4j_style_graph(nodes: List[Dict], relationships: List[Dict], heigh
 def render_multiview_component(nodes: List[Dict], rels: List[Dict], height="600px", key_prefix="graph"):
     """Renders Graph | Table | Raw tabs"""
     t_graph, t_table, t_raw = st.tabs(["🕸️ Graph", "📋 Table", "📄 Raw"])
-    
+
     with t_graph:
         html = create_neo4j_style_graph(nodes, rels, height=height)
-        components.html(html, height=int(height.replace('px','')) + 20, scrolling=False)
-    
+        components.html(html, height=int(
+            height.replace('px', '')) + 20, scrolling=False)
+
     with t_table:
         st.markdown("**Nodes**")
         if nodes:
             df_nodes = pd.DataFrame(nodes)
-            cols = ['id', 'type', 'label'] + [c for c in df_nodes.columns if c not in ['id', 'type', 'label']]
-            st.dataframe(df_nodes[[c for c in cols if c in df_nodes.columns]], use_container_width=True, hide_index=True)
+            cols = ['id', 'type', 'label'] + \
+                [c for c in df_nodes.columns if c not in ['id', 'type', 'label']]
+            st.dataframe(df_nodes[[c for c in cols if c in df_nodes.columns]],
+                         use_container_width=True, hide_index=True)
         else:
             st.info("No nodes")
-            
+
         st.markdown("**Relationships**")
         if rels:
             df_rels = pd.DataFrame(rels)
@@ -276,40 +277,45 @@ def fetch_subgraph_for_query_results(query_engine, original_cypher: str):
     seen_nodes = set()
     seen_rels = set()
     final_query = ""
-    
+
     try:
         with query_engine.driver.session() as session:
             result = session.run(original_cypher)
             records = list(result)
-            
+
             if not records:
                 return [], [], ""
-            
+
             identifiers = set()
+
             def extract_ids(item):
                 if isinstance(item, str) and item:
                     identifiers.add(item)
                 elif isinstance(item, (int, float)):
                     identifiers.add(str(item))
                 elif isinstance(item, list):
-                    for i in item: extract_ids(i)
+                    for i in item:
+                        extract_ids(i)
                 elif isinstance(item, dict):
-                    for v in item.values(): extract_ids(v)
+                    for v in item.values():
+                        extract_ids(v)
                 elif hasattr(item, 'items'):
-                    for k, v in item.items(): extract_ids(v)
+                    for k, v in item.items():
+                        extract_ids(v)
                     if hasattr(item, 'labels'):
                         nid = get_node_id(item)
-                        if nid: identifiers.add(nid)
-            
+                        if nid:
+                            identifiers.add(nid)
+
             for record in records:
                 for key, value in record.items():
                     extract_ids(value)
-            
+
             if not identifiers:
                 return [], [], ""
-            
+
             ids_formatted = str(list(identifiers))
-            
+
             subgraph_query = f"""
             MATCH (anchor)
             WHERE anchor.id IN {ids_formatted} OR anchor.name IN {ids_formatted}
@@ -330,40 +336,46 @@ def fetch_subgraph_for_query_results(query_engine, original_cypher: str):
             RETURN DISTINCT src, r, type(r) as rel_type, tgt, labels(src) as src_labels, labels(tgt) as tgt_labels
             """
             final_query = subgraph_query
-            
+
             result = session.run(subgraph_query)
             records = list(result)
-            
+
             for record in records:
                 src = record.get('src')
                 tgt = record.get('tgt')
                 r = record.get('r')
                 rel_type = record.get('rel_type')
-                
+
                 if src:
                     src_id = get_node_id(src)
                     if src_id and src_id not in seen_nodes:
-                        src_type = record.get('src_labels', ['Unknown'])[0] if record.get('src_labels') else 'Unknown'
-                        nodes.append({'id': src_id, 'label': get_node_label(src), 'type': src_type, **dict(src)})
+                        src_type = record.get('src_labels', ['Unknown'])[
+                            0] if record.get('src_labels') else 'Unknown'
+                        nodes.append({'id': src_id, 'label': get_node_label(
+                            src), 'type': src_type, **dict(src)})
                         seen_nodes.add(src_id)
-                
+
                 if tgt:
                     tgt_id = get_node_id(tgt)
                     if tgt_id and tgt_id not in seen_nodes:
-                        tgt_type = record.get('tgt_labels', ['Unknown'])[0] if record.get('tgt_labels') else 'Unknown'
-                        nodes.append({'id': tgt_id, 'label': get_node_label(tgt), 'type': tgt_type, **dict(tgt)})
+                        tgt_type = record.get('tgt_labels', ['Unknown'])[
+                            0] if record.get('tgt_labels') else 'Unknown'
+                        nodes.append({'id': tgt_id, 'label': get_node_label(
+                            tgt), 'type': tgt_type, **dict(tgt)})
                         seen_nodes.add(tgt_id)
-                
+
                 if src and tgt and rel_type:
                     src_id = get_node_id(src)
                     tgt_id = get_node_id(tgt)
-                    rel_key = str(src_id) + "-" + str(rel_type) + "->" + str(tgt_id)
+                    rel_key = str(src_id) + "-" + \
+                        str(rel_type) + "->" + str(tgt_id)
                     if rel_key not in seen_rels:
-                        relationships.append({'source': src_id, 'target': tgt_id, 'type': rel_type})
+                        relationships.append(
+                            {'source': src_id, 'target': tgt_id, 'type': rel_type})
                         seen_rels.add(rel_key)
-            
+
             return nodes, relationships, final_query
-    
+
     except Exception as e:
         print("Subgraph fetch error: " + str(e))
         return [], [], ""
@@ -376,20 +388,22 @@ def render_sidebar():
         st.title("⚖️ RAG Comparison")
         st.caption("Graph RAG vs Traditional RAG")
         st.divider()
-        
+
         st.header("📁 Upload Data")
-        uploaded = st.file_uploader("Risk Analysis Excel", type=['xlsx', 'xls','zip'])
-        #uploaded = st.file_uploader("Upload Zip containing Excel files", type=['zip'])
-        
+        uploaded = st.file_uploader(
+            "Risk Analysis Excel", type=['xlsx', 'xls', 'zip'])
+        # uploaded = st.file_uploader("Upload Zip containing Excel files", type=['zip'])
+
         if uploaded:
             clear = st.checkbox("Clear existing data", value=True)
-            
+
             if st.button("🚀 Load Both RAG Systems", type="primary", use_container_width=True):
                 # 2. Extract and process the zip file
                 with zipfile.ZipFile(uploaded) as z:
                     # Filter for only excel files inside the zip
-                    excel_files = [f for f in z.namelist() if f.endswith(('.xlsx', '.xls'))]
-                    
+                    excel_files = [f for f in z.namelist(
+                    ) if f.endswith(('.xlsx', '.xls'))]
+
                     if not excel_files:
                         st.error("No Excel files found in the ZIP.")
                     else:
@@ -397,33 +411,38 @@ def render_sidebar():
                             with z.open(file_name) as f:
                                 # We wrap in BytesIO so the RAG loaders treat it like a file object
                                 file_content = io.BytesIO(f.read())
-                                file_content.name = file_name # Preserve filename for metadata
-                                
+                                file_content.name = file_name  # Preserve filename for metadata
+
                                 st.write(f"Processing: {file_name}...")
-                                load_graph_rag(file_content, config.NEO4J_URI, config.NEO4J_USER, config.NEO4J_PASSWORD, config.OPENAI_API_KEY, clear)
-                                load_traditional_rag(file_content, config.OPENAI_API_KEY, clear)
-                                
-                                # After the first file is loaded, we don't want to 'clear' the DB anymore 
+                                load_graph_rag(file_content, config.NEO4J_URI, config.NEO4J_USER,
+                                               config.NEO4J_PASSWORD, config.OPENAI_API_KEY, clear)
+                                load_traditional_rag(
+                                    file_content, config.OPENAI_API_KEY, clear)
+
+                                # After the first file is loaded, we don't want to 'clear' the DB anymore
                                 # or we will wipe the previous file's data
-                                clear = False 
+                                clear = False
                         st.success("All files from ZIP loaded!")
 
             # Optional: Add single-RAG loading logic here using the same loop as above
-            
+
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
-            status = "✅" if st.session_state.get('graph_rag_loaded', False) else "❌"
+            status = "✅" if st.session_state.get(
+                'graph_rag_loaded', False) else "❌"
             st.metric("Graph RAG", status)
         with col2:
-            status = "✅" if st.session_state.get('trad_rag_loaded', False) else "❌"
+            status = "✅" if st.session_state.get(
+                'trad_rag_loaded', False) else "❌"
             st.metric("Trad RAG", status)
-        
+
         st.divider()
         st.header("🎨 Legend")
         # Ensure NODE_COLORS is defined globally or imported
         for node_type, color in NODE_COLORS.items():
-            st.markdown(f"<span style='color:{color};font-size:16px'>●</span> {node_type}", unsafe_allow_html=True)
+            st.markdown(
+                f"<span style='color:{color};font-size:16px'>●</span> {node_type}", unsafe_allow_html=True)
 
 
 def load_graph_rag(uploaded, uri, user, pwd, openai_key, clear):
@@ -432,31 +451,34 @@ def load_graph_rag(uploaded, uri, user, pwd, openai_key, clear):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
         tmp.write(uploaded.getvalue())
         tmp.close()
-        
+
         with st.sidebar:
             progress = st.progress(0, text="Parsing Excel...")
             data = parse_excel(tmp.name)
             progress.progress(30, text="Loading to Neo4j...")
-            
+
             stats = load_to_neo4j(data, uri=uri, user=user, password=pwd, clear_existing=clear,
                                   progress_callback=lambda p, m: progress.progress(min(30 + int(p*60), 90), text=m))
-            
+
             progress.progress(95, text="Initializing query engine...")
             qe = graph_query_engine.QueryEngine(uri, user, pwd, openai_key)
             qe.connect()
-            
+
             st.session_state.graph_query_engine = qe
             st.session_state.graph_rag_loaded = True
             st.session_state.graph_stats = stats
-            
+
             progress.progress(100, text="✅ Graph RAG Ready!")
-            st.toast(f"Graph RAG Loaded: {stats.get('hazards', 0)} hazards", icon="🕸️")
+            st.toast(
+                f"Graph RAG Loaded: {stats.get('hazards', 0)} hazards", icon="🕸️")
     except Exception as e:
         st.sidebar.error("Graph RAG Error: " + str(e))
     finally:
         if tmp and os.path.exists(tmp.name):
-            try: os.unlink(tmp.name)
-            except: pass
+            try:
+                os.unlink(tmp.name)
+            except:
+                pass
 
 
 def load_traditional_rag(uploaded, openai_key, clear):
@@ -465,25 +487,26 @@ def load_traditional_rag(uploaded, openai_key, clear):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
         tmp.write(uploaded.getvalue())
         tmp.close()
-        
+
         with st.sidebar:
             progress = st.progress(0, text="Parsing Excel...")
             data = parse_excel(tmp.name)
-            
+
             progress.progress(20, text="Building documents...")
-            docs, metas, stats = build_rag_documents(data, source_name=uploaded.name)
-            
+            docs, metas, stats = build_rag_documents(
+                data, source_name=uploaded.name)
+
             progress.progress(40, text="Initializing ChromaDB...")
             if not st.session_state.vector_store:
                 st.session_state.vector_store = ChromaVectorStore(
                     persist_dir=config.CHROMA_PERSIST_DIR,
                     collection_name=config.CHROMA_COLLECTION
                 )
-            
+
             store = st.session_state.vector_store
             if clear:
                 store.reset()
-            
+
             progress.progress(50, text="Embedding documents...")
             from openai import OpenAI
             client = OpenAI(api_key=openai_key)
@@ -491,23 +514,26 @@ def load_traditional_rag(uploaded, openai_key, clear):
                 oai=client, documents=docs, metadatas=metas,
                 embedding_model=config.OPENAI_EMBEDDING_MODEL
             )
-            
+
             progress.progress(90, text="Initializing query engine...")
-            qe = trad_query_engine.QueryEngine(vector_store=store, openai_api_key=openai_key)
+            qe = trad_query_engine.QueryEngine(
+                vector_store=store, openai_api_key=openai_key)
             qe.connect()
-            
+
             st.session_state.trad_query_engine = qe
             st.session_state.trad_rag_loaded = True
             st.session_state.trad_stats = {**stats, 'indexed': added}
-            
+
             progress.progress(100, text="✅ Traditional RAG Ready!")
             st.toast(f"Traditional RAG Loaded: {added} docs", icon="📚")
     except Exception as e:
         st.sidebar.error("Traditional RAG Error: " + str(e))
     finally:
         if tmp and os.path.exists(tmp.name):
-            try: os.unlink(tmp.name)
-            except: pass
+            try:
+                os.unlink(tmp.name)
+            except:
+                pass
 
 
 # ==================== MAIN CHAT INTERFACE ====================
@@ -515,7 +541,7 @@ def load_traditional_rag(uploaded, openai_key, clear):
 def main():
     init_session_state()
     render_sidebar()
-    
+
     # Modern Header
     st.markdown("""
         <div style="text-align: center; margin-bottom: 2rem;">
@@ -523,10 +549,10 @@ def main():
             <p style="color: #666; font-size: 1.1rem;">Comparing Graph Logic vs. Vector Similarity</p>
         </div>
     """, unsafe_allow_html=True)
-    
+
     # Chat Container (Scrollable)
     chat_container = st.container()
-    
+
     # Input Area (Fixed at bottom)
     if prompt := st.chat_input("Ask a complex question about hazards..."):
         process_user_query(prompt)
@@ -546,12 +572,12 @@ def main():
             for i, s in enumerate(samples):
                 if cols[i % 2].button(s, key=f"sample_{i}", use_container_width=True):
                     process_user_query(s)
-        
+
         for msg in st.session_state.messages:
             # User Message
             with st.chat_message("user"):
                 st.markdown(msg['question'])
-            
+
             # Assistant Message (The Comparison)
             with st.chat_message("assistant"):
                 render_comparison_result(msg)
@@ -559,7 +585,7 @@ def main():
 
 def process_user_query(question: str):
     """Run comparison and update history."""
-    
+
     # 1. Check if engines are loaded
     if not st.session_state.graph_rag_loaded and not st.session_state.trad_rag_loaded:
         st.error("⚠️ Please load data first using the sidebar.")
@@ -570,17 +596,19 @@ def process_user_query(question: str):
         st.markdown(question)
 
     results = {'question': question, 'graph_rag': None, 'trad_rag': None}
-    
+
     # >>> SHOW PROCESSING STATUS INSIDE ASSISTANT BLOCK <<<
     with st.chat_message("assistant"):
         with st.status("Running dual-engine analysis...", expanded=True) as status:
-            
+
             # --- Graph RAG Execution ---
             if st.session_state.graph_rag_loaded:
                 status.write("🕸️ Querying Knowledge Graph...")
                 try:
-                    cypher, raw_results, answer = st.session_state.graph_query_engine.query(question)
-                    nodes, rels, viz_query = fetch_subgraph_for_query_results(st.session_state.graph_query_engine, cypher)
+                    cypher, raw_results, answer = st.session_state.graph_query_engine.query(
+                        question)
+                    nodes, rels, viz_query = fetch_subgraph_for_query_results(
+                        st.session_state.graph_query_engine, cypher)
                     results['graph_rag'] = {
                         'answer': answer,
                         'cypher': cypher,
@@ -590,12 +618,13 @@ def process_user_query(question: str):
                     }
                 except Exception as e:
                     results['graph_rag'] = {'error': str(e)}
-            
+
             # --- Trad RAG Execution ---
             if st.session_state.trad_rag_loaded:
                 status.write("📚 Searching Vector Embeddings...")
                 try:
-                    debug, hits, answer = st.session_state.trad_query_engine.query(question)
+                    debug, hits, answer = st.session_state.trad_query_engine.query(
+                        question)
                     results['trad_rag'] = {
                         'answer': answer,
                         'debug': debug,
@@ -603,8 +632,9 @@ def process_user_query(question: str):
                     }
                 except Exception as e:
                     results['trad_rag'] = {'error': str(e)}
-            
-            status.update(label="Analysis Complete", state="complete", expanded=False)
+
+            status.update(label="Analysis Complete",
+                          state="complete", expanded=False)
 
     # Save and Refresh
     st.session_state.messages.append(results)
@@ -613,14 +643,14 @@ def process_user_query(question: str):
 
 def render_comparison_result(results: Dict):
     """Render the side-by-side comparison block inside the chat."""
-    
+
     col1, col2 = st.columns(2)
-    
+
     # --- LEFT COLUMN: Graph RAG ---
     with col1:
         st.markdown("### 🕸️ Graph RAG")
         gr = results.get('graph_rag')
-        
+
         if not st.session_state.graph_rag_loaded:
             st.info("System not loaded")
         elif not gr:
@@ -630,27 +660,28 @@ def render_comparison_result(results: Dict):
         else:
             # The Answer
             st.markdown(gr.get('answer', 'No answer produced'))
-            
+
             # The Evidence (Graph) - ALWAYS VISIBLE, BIGGER
             nodes = gr.get('nodes', [])
             rels = gr.get('rels', [])
             if nodes:
                 st.markdown(f"**📊 Live Graph ({len(nodes)} nodes)**")
                 # Increased height to 600px
-                render_multiview_component(nodes, rels, height="600px", key_prefix=f"chat_graph_{len(nodes)}_{id(gr)}")
-            
+                render_multiview_component(
+                    nodes, rels, height="600px", key_prefix=f"chat_graph_{len(nodes)}_{id(gr)}")
+
             # The Logic (Cypher)
             with st.expander("🔧 Internal Logic (Cypher)"):
                 st.code(gr.get('cypher', ''), language='cypher')
                 if gr.get('viz_query'):
-                     st.caption("Neo4j Browser Sync Code:")
-                     st.code(gr['viz_query'], language='cypher')
+                    st.caption("Neo4j Browser Sync Code:")
+                    st.code(gr['viz_query'], language='cypher')
 
     # --- RIGHT COLUMN: Traditional RAG ---
     with col2:
         st.markdown("### 📚 Traditional RAG")
         tr = results.get('trad_rag')
-        
+
         if not st.session_state.trad_rag_loaded:
             st.info("System not loaded")
         elif not tr:
@@ -660,7 +691,7 @@ def render_comparison_result(results: Dict):
         else:
             # The Answer
             st.markdown(tr.get('answer', 'No answer produced'))
-            
+
             # The Evidence (Docs)
             hits = tr.get('hits', [])
             if hits:
@@ -668,7 +699,8 @@ def render_comparison_result(results: Dict):
                     for i, h in enumerate(hits[:3]):
                         meta = h.get('meta', {})
                         score = round(h.get('distance', 0), 3)
-                        st.markdown(f"**{i+1}. {meta.get('doc_type','Doc')}** (Dist: {score})")
+                        st.markdown(
+                            f"**{i+1}. {meta.get('doc_type', 'Doc')}** (Dist: {score})")
                         st.text(h.get('text', '')[:200] + "...")
                         st.divider()
 
