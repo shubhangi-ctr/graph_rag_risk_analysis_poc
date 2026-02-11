@@ -4,27 +4,39 @@ Converts natural language questions to Cypher queries using LLM and executes the
 Supports full scope requirements including all node types and relationships.
 """
 import os
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 from neo4j import GraphDatabase
 from openai import OpenAI
 import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from graph_rag.chroma_store import GraphChromaStore
 
 
 class QueryEngine:
     """Handles natural language to Cypher conversion and query execution."""
     
-    def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, 
-                 neo4j_password: str = None, openai_api_key: str = None):
+    def __init__(
+        self,
+        neo4j_uri: str = None,
+        neo4j_user: str = None,
+        neo4j_password: str = None,
+        openai_api_key: str = None,
+        chroma_persist_dir: str = None,
+        graph_collection_name: str = None,
+        graph_top_k: int = None,
+    ):
         self.neo4j_uri = neo4j_uri or config.NEO4J_URI
         self.neo4j_user = neo4j_user or config.NEO4J_USER
         self.neo4j_password = neo4j_password or config.NEO4J_PASSWORD
         self.openai_api_key = openai_api_key or config.OPENAI_API_KEY
+        self.chroma_persist_dir = chroma_persist_dir or config.CHROMA_PERSIST_DIR
+        self.graph_collection_name = graph_collection_name or config.GRAPH_CHROMA_COLLECTION
+        self.graph_top_k = graph_top_k or config.GRAPH_CHROMA_TOP_K
         
         self.driver = None
         self.client = None
+        self.graph_store = None
         self.prompt_template = self._load_prompt_template()
     
     def _load_prompt_template(self) -> str:
@@ -37,12 +49,17 @@ class QueryEngine:
             return "You are a Cypher expert. Question: {question}. Return ONLY the Cypher query."
     
     def connect(self):
-        """Establish connections to Neo4j and OpenAI."""
+        """Establish connections to Neo4j, OpenAI, and Graph Chroma store."""
         self.driver = GraphDatabase.driver(
             self.neo4j_uri, 
             auth=(self.neo4j_user, self.neo4j_password)
         )
-        
+
+        self.graph_store = GraphChromaStore(
+            persist_dir=self.chroma_persist_dir,
+            collection_name=self.graph_collection_name,
+        )
+
         if self.openai_api_key:
             self.client = OpenAI(api_key=self.openai_api_key)
         
@@ -53,12 +70,54 @@ class QueryEngine:
         if self.driver:
             self.driver.close()
     
-    def generate_cypher(self, question: str) -> str:
-        """Generate Cypher query from natural language using LLM."""
+    def retrieve_graph_chunks(self, question: str, top_k: int = None) -> List[Dict[str, Any]]:
+        """Retrieve relevant graph knowledge chunks from Chroma."""
+        if not self.client:
+            raise ValueError("OpenAI client not initialized. Please provide API key.")
+        if not self.graph_store:
+            raise ValueError("Graph Chroma store not initialized. Call connect() first.")
+
+        return self.graph_store.query(
+            oai=self.client,
+            query_text=question,
+            embedding_model=config.OPENAI_EMBEDDING_MODEL,
+            top_k=top_k or self.graph_top_k,
+        )
+
+    def _format_graph_context(self, chunks: List[Dict[str, Any]]) -> str:
+        """Serialize retrieved graph chunks for Cypher prompt conditioning."""
+        if not chunks:
+            return ""
+
+        blocks: List[str] = []
+        for i, hit in enumerate(chunks, start=1):
+            meta = hit.get("meta") or {}
+            text = (hit.get("text") or "").strip()
+            if len(text) > 900:
+                text = text[:900] + "..."
+            blocks.append(
+                "\n".join(
+                    [
+                        f"[chunk={i}] source={meta.get('source','')} doc_type={meta.get('doc_type','')} id={meta.get('id','')} distance={hit.get('distance')}",
+                        text,
+                    ]
+                )
+            )
+        return "\n\n---\n\n".join(blocks)
+
+    def generate_cypher(self, question: str, context_chunks: List[Dict[str, Any]] = None) -> str:
+        """Generate Cypher query from natural language + retrieved graph context."""
         if not self.client:
             raise ValueError("OpenAI client not initialized. Please provide API key.")
         
         prompt = self.prompt_template.format(question=question)
+        if context_chunks:
+            graph_context = self._format_graph_context(context_chunks)
+            prompt += (
+                "\n\n## Retrieved Knowledge Graph Context\n"
+                "Use this evidence to choose correct labels/properties and narrow filters.\n"
+                f"{graph_context}"
+            )
         
         response = self.client.chat.completions.create(
             model=config.OPENAI_MODEL,
@@ -180,23 +239,30 @@ Provide a helpful, conversational answer that summarizes the key findings. Inclu
         
         return "\n".join(output)
     
-    def query(self, question: str) -> Tuple[str, List[Dict[str, Any]], str]:
+    def query(self, question: str) -> Tuple[str, List[Dict[str, Any]], str, List[Dict[str, Any]]]:
         """
-        Full query pipeline: question -> cypher -> execute -> format
-        Returns: (cypher_query, raw_results, formatted_answer)
+        Full query pipeline: question -> graph chunk retrieval -> cypher -> execute -> format
+        Returns: (cypher_query, raw_results, formatted_answer, retrieved_chunks)
         """
-        cypher = self.generate_cypher(question)
+        chunks: List[Dict[str, Any]] = []
+        try:
+            chunks = self.retrieve_graph_chunks(question, top_k=self.graph_top_k)
+        except Exception:
+            # Retrieval failure should not block query execution.
+            chunks = []
+
+        cypher = self.generate_cypher(question, context_chunks=chunks)
         
         if cypher.startswith("// Cannot answer"):
-            return cypher, [], cypher.replace("// ", "")
+            return cypher, [], cypher.replace("// ", ""), chunks
         
         try:
             results = self.execute_cypher(cypher)
             answer = self.format_results(question, cypher, results)
-            return cypher, results, answer
+            return cypher, results, answer, chunks
         except Exception as e:
             error_msg = f"Query execution error: {str(e)}"
-            return cypher, [], error_msg
+            return cypher, [], error_msg, chunks
     
     def get_sample_queries(self) -> List[Dict[str, str]]:
         """Return sample queries for the UI - covers all scope requirements."""
@@ -337,9 +403,10 @@ if __name__ == "__main__":
         question = "Which controls mitigate multiple hazards?"
         print(f"Question: {question}")
         
-        cypher, results, answer = engine.query(question)
+        cypher, results, answer, chunks = engine.query(question)
         print(f"\nGenerated Cypher:\n{cypher}")
         print(f"\nResults count: {len(results)}")
+        print(f"\nRetrieved chunks: {len(chunks)}")
         print(f"\nFormatted Answer:\n{answer}")
     except Exception as e:
         print(f"Error: {e}")

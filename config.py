@@ -20,7 +20,9 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 # ChromaDB Configuration (Traditional RAG)
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "risk_rag_chunks")
+GRAPH_CHROMA_COLLECTION = os.getenv("GRAPH_CHROMA_COLLECTION", "risk_graph_kg_chunks")
 TOP_K = int(os.getenv("TOP_K", "6"))
+GRAPH_CHROMA_TOP_K = int(os.getenv("GRAPH_CHROMA_TOP_K", "6"))
 
 # Application Settings
 APP_TITLE = "RAG Comparison - Graph vs Traditional"

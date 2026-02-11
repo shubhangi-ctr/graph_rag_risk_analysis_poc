@@ -4,19 +4,21 @@ Combined RAG Application - Graph RAG vs Traditional RAG Side-by-Side Comparison
 from traditional_rag import query_engine as trad_query_engine
 from traditional_rag.vector_store import ChromaVectorStore, build_rag_documents
 from graph_rag import query_engine as graph_query_engine
-from graph_rag.graph_loader import GraphLoader, load_to_neo4j
+from graph_rag.graph_loader import load_to_neo4j
+from graph_rag.chroma_store import GraphChromaStore, sync_graph_knowledge_from_neo4j
 import config
-from excel_parser import parse_excel, ParsedData
+from excel_parser import parse_excel
 import streamlit as st
 import streamlit.components.v1 as components
 import os
 import sys
-import tempfile
 import json
 import pandas as pd
 from typing import List, Dict, Any, Tuple
 import zipfile
-import io
+import tempfile
+import shutil
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,7 +27,7 @@ st.set_page_config(
     page_title=config.APP_TITLE,
     page_icon="⚖️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # Neo4j Browser color palette
@@ -53,6 +55,10 @@ NODE_SIZES = {
     'LifecyclePhase': 20,
 }
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_LOAD_MARKER = os.path.join(BASE_DIR, ".data_initialized.json")
+
 
 def init_session_state():
     defaults = {
@@ -62,12 +68,246 @@ def init_session_state():
         'graph_query_engine': None,
         'trad_query_engine': None,
         'vector_store': None,
+        'graph_vector_store': None,
         'graph_stats': None,
         'trad_stats': None,
+        'data_bootstrap_done': False,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+
+def _load_data_marker() -> Dict[str, Any]:
+    if not os.path.exists(DATA_LOAD_MARKER):
+        return {}
+    try:
+        with open(DATA_LOAD_MARKER, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_data_marker(sources: List[str]) -> None:
+    payload = {
+        "initialized_at_utc": datetime.now(timezone.utc).isoformat(),
+        "sources": sources,
+    }
+    with open(DATA_LOAD_MARKER, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _discover_data_sources() -> Tuple[List[Tuple[str, str]], List[str]]:
+    """
+    Returns:
+        - List[(excel_file_path, source_name)]
+        - Temporary directories created for extracted ZIP contents
+    """
+    sources: List[Tuple[str, str]] = []
+    temp_dirs: List[str] = []
+
+    if not os.path.isdir(DATA_DIR):
+        return sources, temp_dirs
+
+    for root, _, files in os.walk(DATA_DIR):
+        for name in files:
+            file_path = os.path.join(root, name)
+            lower = name.lower()
+
+            if lower.endswith((".xlsx", ".xls")):
+                source_name = os.path.relpath(file_path, DATA_DIR)
+                sources.append((file_path, source_name))
+                continue
+
+            if lower.endswith(".zip"):
+                extract_dir = tempfile.mkdtemp(prefix="rag_zip_")
+                temp_dirs.append(extract_dir)
+                try:
+                    with zipfile.ZipFile(file_path) as zf:
+                        zf.extractall(extract_dir)
+                except Exception:
+                    continue
+
+                for z_root, _, z_files in os.walk(extract_dir):
+                    for z_name in z_files:
+                        if not z_name.lower().endswith((".xlsx", ".xls")):
+                            continue
+                        z_path = os.path.join(z_root, z_name)
+                        rel_in_zip = os.path.relpath(z_path, extract_dir)
+                        source_name = f"{os.path.basename(file_path)}::{rel_in_zip}"
+                        sources.append((z_path, source_name))
+
+    sources.sort(key=lambda item: item[1].lower())
+    return sources, temp_dirs
+
+
+def _graph_chroma_store_has_data() -> bool:
+    try:
+        if not st.session_state.graph_vector_store:
+            st.session_state.graph_vector_store = GraphChromaStore(
+                persist_dir=config.CHROMA_PERSIST_DIR,
+                collection_name=config.GRAPH_CHROMA_COLLECTION,
+            )
+        return st.session_state.graph_vector_store.count() > 0
+    except Exception:
+        return False
+
+
+def _traditional_store_has_data() -> bool:
+    try:
+        store = ChromaVectorStore(
+            persist_dir=config.CHROMA_PERSIST_DIR,
+            collection_name=config.CHROMA_COLLECTION,
+        )
+        return store.count() > 0
+    except Exception:
+        return False
+
+
+def _init_graph_engine(uri: str, user: str, pwd: str, openai_key: str) -> bool:
+    if st.session_state.graph_rag_loaded and st.session_state.graph_query_engine:
+        return True
+    try:
+        qe = graph_query_engine.QueryEngine(uri, user, pwd, openai_key)
+        qe.connect()
+        graph_chunks = qe.graph_store.count() if qe.graph_store else 0
+        with qe.driver.session() as session:
+            row = session.run(
+                "MATCH (h:Hazard) RETURN count(h) AS count").single()
+        if not row or row["count"] <= 0 or graph_chunks <= 0:
+            qe.close()
+            return False
+        st.session_state.graph_query_engine = qe
+        st.session_state.graph_rag_loaded = True
+        st.session_state.graph_stats = {
+            **(st.session_state.graph_stats or {}),
+            "hazards": row["count"],
+            "graph_chunks": graph_chunks,
+        }
+        return True
+    except Exception:
+        return False
+
+
+def _init_traditional_engine(openai_key: str) -> bool:
+    if st.session_state.trad_rag_loaded and st.session_state.trad_query_engine:
+        return True
+    try:
+        if not st.session_state.vector_store:
+            st.session_state.vector_store = ChromaVectorStore(
+                persist_dir=config.CHROMA_PERSIST_DIR,
+                collection_name=config.CHROMA_COLLECTION,
+            )
+        store = st.session_state.vector_store
+        if store.count() <= 0:
+            return False
+        qe = trad_query_engine.QueryEngine(
+            vector_store=store, openai_api_key=openai_key)
+        qe.connect()
+        st.session_state.trad_query_engine = qe
+        st.session_state.trad_rag_loaded = True
+        st.session_state.trad_stats = {'indexed': store.count()}
+        return True
+    except Exception:
+        return False
+
+
+def bootstrap_data_from_directory() -> None:
+    if st.session_state.get('data_bootstrap_done', False):
+        return
+
+    marker = _load_data_marker()
+    graph_chroma_has_data = _graph_chroma_store_has_data()
+    trad_has_data = _traditional_store_has_data()
+
+    if graph_chroma_has_data and trad_has_data:
+        graph_ok = _init_graph_engine(config.NEO4J_URI, config.NEO4J_USER,
+                                      config.NEO4J_PASSWORD, config.OPENAI_API_KEY)
+        trad_ok = _init_traditional_engine(config.OPENAI_API_KEY)
+        if not marker:
+            _write_data_marker([])
+        if graph_ok and trad_ok:
+            st.sidebar.info(
+                "Using previously indexed data. Skipping re-index.")
+        elif not graph_ok:
+            st.sidebar.warning(
+                "Graph-KG Chroma has data, so Neo4j upload is skipped. Graph RAG is unavailable until Neo4j data is restored.")
+        st.session_state.data_bootstrap_done = True
+        return
+
+    need_graph_ingest = not graph_chroma_has_data
+    need_trad_ingest = not trad_has_data
+
+    if marker and (need_graph_ingest or need_trad_ingest):
+        st.sidebar.warning(
+            "Existing initialization marker found, but one or both stores are empty. Re-indexing from `data` directory.")
+
+    sources, temp_dirs = _discover_data_sources()
+    try:
+        if not sources:
+            st.sidebar.warning(
+                f"No Excel/ZIP files found in `{DATA_DIR}`. Add files and restart the app.")
+            st.session_state.data_bootstrap_done = True
+            return
+
+        if need_graph_ingest and need_trad_ingest:
+            st.sidebar.info(
+                f"Loading {len(sources)} file(s) from `{DATA_DIR}` into Graph + Traditional RAG...")
+        elif need_graph_ingest:
+            st.sidebar.info(
+                f"Graph-KG Chroma is empty. Loading {len(sources)} file(s) to Neo4j once, then indexing graph chunks...")
+        elif need_trad_ingest:
+            st.sidebar.info(
+                f"Traditional RAG Chroma is empty. Loading {len(sources)} file(s) for vector chunks...")
+
+        graph_clear = True
+        trad_clear = True
+        for file_path, source_name in sources:
+            st.sidebar.write(f"Processing: `{source_name}`")
+            if need_graph_ingest:
+                load_graph_rag(
+                    file_path=file_path,
+                    source_name=source_name,
+                    uri=config.NEO4J_URI,
+                    user=config.NEO4J_USER,
+                    pwd=config.NEO4J_PASSWORD,
+                    clear=graph_clear,
+                )
+                graph_clear = False
+
+            if need_trad_ingest:
+                load_traditional_rag(
+                    file_path=file_path,
+                    source_name=source_name,
+                    openai_key=config.OPENAI_API_KEY,
+                    clear=trad_clear,
+                )
+                trad_clear = False
+
+        if need_graph_ingest:
+            index_graph_kg_chunks_from_neo4j(
+                uri=config.NEO4J_URI,
+                user=config.NEO4J_USER,
+                pwd=config.NEO4J_PASSWORD,
+                openai_key=config.OPENAI_API_KEY,
+                source_name="|".join([s for _, s in sources])[:400],
+                clear=True,
+            )
+
+        graph_ready = _init_graph_engine(config.NEO4J_URI, config.NEO4J_USER,
+                                         config.NEO4J_PASSWORD, config.OPENAI_API_KEY)
+        trad_ready = _init_traditional_engine(config.OPENAI_API_KEY)
+
+        if graph_ready and trad_ready:
+            _write_data_marker([s for _, s in sources])
+            st.sidebar.success("Data initialized from local `data` directory.")
+        else:
+            st.sidebar.error(
+                "Data initialization did not complete for both RAG systems.")
+    finally:
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        st.session_state.data_bootstrap_done = True
 
 
 # ==================== GRAPH VISUALIZATION FUNCTIONS ====================
@@ -385,59 +625,26 @@ def fetch_subgraph_for_query_results(query_engine, original_cypher: str):
 
 def render_sidebar():
     with st.sidebar:
-        st.title("⚖️ RAG Comparison")
-        st.caption("Graph RAG vs Traditional RAG")
-        st.divider()
+        # st.title("⚖️ RAG Comparison")
+        # st.caption("Graph RAG vs Traditional RAG")
+        # st.divider()
 
-        st.header("📁 Upload Data")
-        uploaded = st.file_uploader(
-            "Risk Analysis Excel", type=['xlsx', 'xls', 'zip'])
-        # uploaded = st.file_uploader("Upload Zip containing Excel files", type=['zip'])
+        # st.header("📁 Data Source")
+        # st.caption(f"Auto-loading from local directory: `{DATA_DIR}`")
+        bootstrap_data_from_directory()
 
-        if uploaded:
-            clear = st.checkbox("Clear existing data", value=True)
+        # st.divider()
+        # col1, col2 = st.columns(2)
+        # with col1:
+        #     status = "✅" if st.session_state.get(
+        #         'graph_rag_loaded', False) else "❌"
+        #     st.metric("Graph RAG", status)
+        # with col2:
+        #     status = "✅" if st.session_state.get(
+        #         'trad_rag_loaded', False) else "❌"
+        #     st.metric("Trad RAG", status)
 
-            if st.button("🚀 Load Both RAG Systems", type="primary", use_container_width=True):
-                # 2. Extract and process the zip file
-                with zipfile.ZipFile(uploaded) as z:
-                    # Filter for only excel files inside the zip
-                    excel_files = [f for f in z.namelist(
-                    ) if f.endswith(('.xlsx', '.xls'))]
-
-                    if not excel_files:
-                        st.error("No Excel files found in the ZIP.")
-                    else:
-                        for file_name in excel_files:
-                            with z.open(file_name) as f:
-                                # We wrap in BytesIO so the RAG loaders treat it like a file object
-                                file_content = io.BytesIO(f.read())
-                                file_content.name = file_name  # Preserve filename for metadata
-
-                                st.write(f"Processing: {file_name}...")
-                                load_graph_rag(file_content, config.NEO4J_URI, config.NEO4J_USER,
-                                               config.NEO4J_PASSWORD, config.OPENAI_API_KEY, clear)
-                                load_traditional_rag(
-                                    file_content, config.OPENAI_API_KEY, clear)
-
-                                # After the first file is loaded, we don't want to 'clear' the DB anymore
-                                # or we will wipe the previous file's data
-                                clear = False
-                        st.success("All files from ZIP loaded!")
-
-            # Optional: Add single-RAG loading logic here using the same loop as above
-
-        st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            status = "✅" if st.session_state.get(
-                'graph_rag_loaded', False) else "❌"
-            st.metric("Graph RAG", status)
-        with col2:
-            status = "✅" if st.session_state.get(
-                'trad_rag_loaded', False) else "❌"
-            st.metric("Trad RAG", status)
-
-        st.divider()
+        # st.divider()
         st.header("🎨 Legend")
         # Ensure NODE_COLORS is defined globally or imported
         for node_type, color in NODE_COLORS.items():
@@ -445,56 +652,69 @@ def render_sidebar():
                 f"<span style='color:{color};font-size:16px'>●</span> {node_type}", unsafe_allow_html=True)
 
 
-def load_graph_rag(uploaded, uri, user, pwd, openai_key, clear):
-    tmp = None
+def load_graph_rag(file_path, source_name, uri, user, pwd, clear):
     try:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-        tmp.write(uploaded.getvalue())
-        tmp.close()
-
         with st.sidebar:
             progress = st.progress(0, text="Parsing Excel...")
-            data = parse_excel(tmp.name)
+            data = parse_excel(file_path)
             progress.progress(30, text="Loading to Neo4j...")
 
             stats = load_to_neo4j(data, uri=uri, user=user, password=pwd, clear_existing=clear,
                                   progress_callback=lambda p, m: progress.progress(min(30 + int(p*60), 90), text=m))
 
-            progress.progress(95, text="Initializing query engine...")
-            qe = graph_query_engine.QueryEngine(uri, user, pwd, openai_key)
-            qe.connect()
-
-            st.session_state.graph_query_engine = qe
-            st.session_state.graph_rag_loaded = True
+            st.session_state.graph_rag_loaded = False
             st.session_state.graph_stats = stats
 
-            progress.progress(100, text="✅ Graph RAG Ready!")
+            progress.progress(100, text="✅ Neo4j Loaded")
             st.toast(
-                f"Graph RAG Loaded: {stats.get('hazards', 0)} hazards", icon="🕸️")
+                f"Neo4j data loaded ({source_name}): {stats.get('hazards', 0)} hazards", icon="🕸️")
     except Exception as e:
         st.sidebar.error("Graph RAG Error: " + str(e))
-    finally:
-        if tmp and os.path.exists(tmp.name):
-            try:
-                os.unlink(tmp.name)
-            except:
-                pass
 
 
-def load_traditional_rag(uploaded, openai_key, clear):
-    tmp = None
+def index_graph_kg_chunks_from_neo4j(uri, user, pwd, openai_key, source_name, clear):
+    """Build Graph-KG chunks from Neo4j and index them in Chroma."""
     try:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-        tmp.write(uploaded.getvalue())
-        tmp.close()
+        with st.sidebar:
+            progress = st.progress(0, text="Reading graph from Neo4j...")
+            stats = sync_graph_knowledge_from_neo4j(
+                neo4j_uri=uri,
+                neo4j_user=user,
+                neo4j_password=pwd,
+                openai_api_key=openai_key,
+                persist_dir=config.CHROMA_PERSIST_DIR,
+                collection_name=config.GRAPH_CHROMA_COLLECTION,
+                embedding_model=config.OPENAI_EMBEDDING_MODEL,
+                source_name=source_name,
+                reset=clear,
+            )
+            progress.progress(100, text="✅ Graph chunks indexed in Chroma")
+            st.toast(
+                f"Graph-KG chunks indexed: {stats.get('graph_indexed_chunks', 0)}", icon="🧠")
 
+            if not st.session_state.graph_vector_store:
+                st.session_state.graph_vector_store = GraphChromaStore(
+                    persist_dir=config.CHROMA_PERSIST_DIR,
+                    collection_name=config.GRAPH_CHROMA_COLLECTION,
+                )
+            st.session_state.graph_stats = {
+                **(st.session_state.graph_stats or {}),
+                **stats,
+                "graph_chunks": st.session_state.graph_vector_store.count(),
+            }
+    except Exception as e:
+        st.sidebar.error("Graph Chroma Index Error: " + str(e))
+
+
+def load_traditional_rag(file_path, source_name, openai_key, clear):
+    try:
         with st.sidebar:
             progress = st.progress(0, text="Parsing Excel...")
-            data = parse_excel(tmp.name)
+            data = parse_excel(file_path)
 
             progress.progress(20, text="Building documents...")
             docs, metas, stats = build_rag_documents(
-                data, source_name=uploaded.name)
+                data, source_name=source_name)
 
             progress.progress(40, text="Initializing ChromaDB...")
             if not st.session_state.vector_store:
@@ -525,15 +745,10 @@ def load_traditional_rag(uploaded, openai_key, clear):
             st.session_state.trad_stats = {**stats, 'indexed': added}
 
             progress.progress(100, text="✅ Traditional RAG Ready!")
-            st.toast(f"Traditional RAG Loaded: {added} docs", icon="📚")
+            st.toast(
+                f"Traditional RAG Loaded ({source_name}): {added} docs", icon="📚")
     except Exception as e:
         st.sidebar.error("Traditional RAG Error: " + str(e))
-    finally:
-        if tmp and os.path.exists(tmp.name):
-            try:
-                os.unlink(tmp.name)
-            except:
-                pass
 
 
 # ==================== MAIN CHAT INTERFACE ====================
@@ -588,7 +803,8 @@ def process_user_query(question: str):
 
     # 1. Check if engines are loaded
     if not st.session_state.graph_rag_loaded and not st.session_state.trad_rag_loaded:
-        st.error("⚠️ Please load data first using the sidebar.")
+        st.error(
+            "⚠️ Data is not ready. Place files in the `data` directory and restart.")
         return
 
     # >>> ECHO USER MESSAGE IMMEDIATELY <<<
@@ -605,13 +821,14 @@ def process_user_query(question: str):
             if st.session_state.graph_rag_loaded:
                 status.write("🕸️ Querying Knowledge Graph...")
                 try:
-                    cypher, raw_results, answer = st.session_state.graph_query_engine.query(
+                    cypher, raw_results, answer, chunks = st.session_state.graph_query_engine.query(
                         question)
                     nodes, rels, viz_query = fetch_subgraph_for_query_results(
                         st.session_state.graph_query_engine, cypher)
                     results['graph_rag'] = {
                         'answer': answer,
                         'cypher': cypher,
+                        'chunks': chunks,
                         'nodes': nodes,
                         'rels': rels,
                         'viz_query': viz_query
@@ -669,6 +886,17 @@ def render_comparison_result(results: Dict):
                 # Increased height to 600px
                 render_multiview_component(
                     nodes, rels, height="600px", key_prefix=f"chat_graph_{len(nodes)}_{id(gr)}")
+
+            chunks = gr.get('chunks', [])
+            if chunks:
+                with st.expander(f"📦 Retrieved Graph Chunks ({len(chunks)})", expanded=False):
+                    for i, h in enumerate(chunks[:4]):
+                        meta = h.get('meta', {})
+                        score = round(h.get('distance', 0), 3)
+                        st.markdown(
+                            f"**{i+1}. {meta.get('doc_type', 'graph_chunk')}** (Dist: {score})")
+                        st.text((h.get('text', '') or '')[:300] + "...")
+                        st.divider()
 
             # The Logic (Cypher)
             with st.expander("🔧 Internal Logic (Cypher)"):
