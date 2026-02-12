@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Tuple
 import zipfile
 import tempfile
 import shutil
+import re
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,7 +28,7 @@ st.set_page_config(
     page_title=config.APP_TITLE,
     page_icon="⚖️",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 # Neo4j Browser color palette
@@ -58,6 +59,7 @@ NODE_SIZES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DATA_LOAD_MARKER = os.path.join(BASE_DIR, ".data_initialized.json")
+INDEX_SCHEMA_VERSION = 2
 
 
 def init_session_state():
@@ -92,6 +94,7 @@ def _write_data_marker(sources: List[str]) -> None:
     payload = {
         "initialized_at_utc": datetime.now(timezone.utc).isoformat(),
         "sources": sources,
+        "index_schema_version": INDEX_SCHEMA_VERSION,
     }
     with open(DATA_LOAD_MARKER, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -153,6 +156,17 @@ def _graph_chroma_store_has_data() -> bool:
         return False
 
 
+def _graph_chroma_store_has_product_metadata() -> bool:
+    try:
+        store = GraphChromaStore(
+            persist_dir=config.CHROMA_PERSIST_DIR,
+            collection_name=config.GRAPH_CHROMA_COLLECTION,
+        )
+        return store.has_metadata_field("product_key")
+    except Exception:
+        return False
+
+
 def _traditional_store_has_data() -> bool:
     try:
         store = ChromaVectorStore(
@@ -160,6 +174,17 @@ def _traditional_store_has_data() -> bool:
             collection_name=config.CHROMA_COLLECTION,
         )
         return store.count() > 0
+    except Exception:
+        return False
+
+
+def _traditional_store_has_product_metadata() -> bool:
+    try:
+        store = ChromaVectorStore(
+            persist_dir=config.CHROMA_PERSIST_DIR,
+            collection_name=config.CHROMA_COLLECTION,
+        )
+        return store.has_metadata_field("product_key")
     except Exception:
         return False
 
@@ -217,10 +242,25 @@ def bootstrap_data_from_directory() -> None:
         return
 
     marker = _load_data_marker()
+    marker_schema_version = int(marker.get(
+        "index_schema_version", 0)) if marker else 0
+    schema_needs_reindex = marker_schema_version < INDEX_SCHEMA_VERSION
     graph_chroma_has_data = _graph_chroma_store_has_data()
+    graph_has_product_metadata = _graph_chroma_store_has_product_metadata(
+    ) if graph_chroma_has_data else False
+    graph_needs_product_reindex = graph_chroma_has_data and not graph_has_product_metadata
     trad_has_data = _traditional_store_has_data()
+    trad_has_product_metadata = _traditional_store_has_product_metadata(
+    ) if trad_has_data else False
+    trad_needs_product_reindex = trad_has_data and not trad_has_product_metadata
 
-    if graph_chroma_has_data and trad_has_data:
+    if (
+        graph_chroma_has_data
+        and trad_has_data
+        and not trad_needs_product_reindex
+        and not graph_needs_product_reindex
+        and not schema_needs_reindex
+    ):
         graph_ok = _init_graph_engine(config.NEO4J_URI, config.NEO4J_USER,
                                       config.NEO4J_PASSWORD, config.OPENAI_API_KEY)
         trad_ok = _init_traditional_engine(config.OPENAI_API_KEY)
@@ -235,8 +275,23 @@ def bootstrap_data_from_directory() -> None:
         st.session_state.data_bootstrap_done = True
         return
 
-    need_graph_ingest = not graph_chroma_has_data
-    need_trad_ingest = not trad_has_data
+    need_graph_ingest = schema_needs_reindex or (
+        not graph_chroma_has_data) or graph_needs_product_reindex
+    need_trad_ingest = schema_needs_reindex or (
+        not trad_has_data) or trad_needs_product_reindex
+
+    if schema_needs_reindex and (graph_chroma_has_data or trad_has_data):
+        st.sidebar.warning(
+            "Indexed data is from an older parsing schema. Re-indexing to include all workbook tabs and improved retrieval coverage."
+        )
+
+    if graph_needs_product_reindex:
+        st.sidebar.warning(
+            "Graph RAG index is from an older schema. Re-indexing to add product-level graph embeddings.")
+
+    if trad_needs_product_reindex:
+        st.sidebar.warning(
+            "Traditional RAG index is from an older schema. Re-indexing to add product-level embeddings.")
 
     if marker and (need_graph_ingest or need_trad_ingest):
         st.sidebar.warning(
@@ -255,10 +310,10 @@ def bootstrap_data_from_directory() -> None:
                 f"Loading {len(sources)} file(s) from `{DATA_DIR}` into Graph + Traditional RAG...")
         elif need_graph_ingest:
             st.sidebar.info(
-                f"Graph-KG Chroma is empty. Loading {len(sources)} file(s) to Neo4j once, then indexing graph chunks...")
+                f"Graph-KG Chroma needs refresh. Loading {len(sources)} file(s) to Neo4j, then indexing graph chunks...")
         elif need_trad_ingest:
             st.sidebar.info(
-                f"Traditional RAG Chroma is empty. Loading {len(sources)} file(s) for vector chunks...")
+                f"Traditional RAG embeddings need refresh. Loading {len(sources)} file(s) for vector chunks...")
 
         graph_clear = True
         trad_clear = True
@@ -555,10 +610,16 @@ def fetch_subgraph_for_query_results(query_engine, original_cypher: str):
                 return [], [], ""
 
             ids_formatted = str(list(identifiers))
+            product_key_match = re.search(
+                r"product_key\s*=\s*'([^']+)'", original_cypher or "", flags=re.IGNORECASE
+            )
+            product_anchor_filter = ""
+            if product_key_match:
+                product_anchor_filter = f" AND anchor.product_key = '{product_key_match.group(1)}'"
 
             subgraph_query = f"""
             MATCH (anchor)
-            WHERE anchor.id IN {ids_formatted} OR anchor.name IN {ids_formatted}
+            WHERE (anchor.id IN {ids_formatted} OR anchor.uid IN {ids_formatted} OR anchor.name IN {ids_formatted}){product_anchor_filter}
             WITH collect(DISTINCT anchor) as anchors
             
             UNWIND anchors as a
@@ -660,6 +721,7 @@ def load_graph_rag(file_path, source_name, uri, user, pwd, clear):
             progress.progress(30, text="Loading to Neo4j...")
 
             stats = load_to_neo4j(data, uri=uri, user=user, password=pwd, clear_existing=clear,
+                                  source_name=source_name,
                                   progress_callback=lambda p, m: progress.progress(min(30 + int(p*60), 90), text=m))
 
             st.session_state.graph_rag_loaded = False
@@ -895,6 +957,8 @@ def render_comparison_result(results: Dict):
                         score = round(h.get('distance', 0), 3)
                         st.markdown(
                             f"**{i+1}. {meta.get('doc_type', 'graph_chunk')}** (Dist: {score})")
+                        if meta.get('product_name'):
+                            st.caption(f"Product: {meta.get('product_name')}")
                         st.text((h.get('text', '') or '')[:300] + "...")
                         st.divider()
 
@@ -929,6 +993,8 @@ def render_comparison_result(results: Dict):
                         score = round(h.get('distance', 0), 3)
                         st.markdown(
                             f"**{i+1}. {meta.get('doc_type', 'Doc')}** (Dist: {score})")
+                        if meta.get('product_name'):
+                            st.caption(f"Product: {meta.get('product_name')}")
                         st.text(h.get('text', '')[:200] + "...")
                         st.divider()
 

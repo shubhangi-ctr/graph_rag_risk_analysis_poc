@@ -10,7 +10,7 @@ Implements full scope requirements including:
 """
 import pandas as pd
 import re
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass, field
 
 
@@ -186,25 +186,49 @@ class ExcelParser:
         self._standards_found: Set[str] = set()
         self._documents_found: Set[str] = set()
         self._lifecycles_found: Set[str] = set()
+        self._cause_counter = 0
+        self._consequence_counter = 0
+        self._sheet_key_tracker: Set[str] = set()
+        self._sheet_control_aliases: Dict[str, Dict[str, str]] = {}
+        self._hazard_signatures: Dict[str, Tuple[Any, ...]] = {}
+        self._control_signatures: Dict[str, Tuple[str, str]] = {}
+        self._hazard_category_ids: Set[str] = set()
+        self._hazard_control_keys: Set[Tuple[str, str, Optional[int], Optional[int]]] = set()
+        self._hazard_actor_keys: Set[Tuple[str, str]] = set()
+        self._hazard_category_keys: Set[Tuple[str, str]] = set()
+        self._hazard_lifecycle_keys: Set[Tuple[str, str]] = set()
+        self._control_standard_keys: Set[Tuple[str, str]] = set()
+        self._control_document_keys: Set[Tuple[str, str]] = set()
+        self._cause_keys: Set[Tuple[str, str]] = set()
+        self._consequence_keys: Set[Tuple[str, str]] = set()
         
     def parse(self) -> ParsedData:
         """Parse all sheets and return structured data."""
-        # Find the sheet with most data (usually the most complete one)
-        best_sheet = self._find_best_sheet()
-        df = pd.read_excel(self.file_path, sheet_name=best_sheet)
-        
-        # Identify table boundaries
-        table_ranges = self._identify_tables(df)
-        
-        # Parse each table
-        if 'table1' in table_ranges:
-            self._parse_basic_hazards(df, table_ranges['table1'])
-        
-        if 'table2' in table_ranges:
-            self._parse_risk_analysis(df, table_ranges['table2'])
-        
-        if 'table3' in table_ranges:
-            self._parse_prevention_measures(df, table_ranges['table3'])
+        for idx, sheet_name in enumerate(self.xl.sheet_names, start=1):
+            try:
+                df = pd.read_excel(self.file_path, sheet_name=sheet_name)
+            except Exception:
+                continue
+
+            if df is None or df.empty:
+                continue
+
+            table_ranges = self._identify_tables(df)
+            if not table_ranges:
+                continue
+
+            sheet_key = self._build_sheet_key(sheet_name, idx)
+            self._sheet_control_aliases.setdefault(sheet_key, {})
+
+            if 'table1' in table_ranges:
+                self._parse_basic_hazards(df, table_ranges['table1'])
+
+            # Parse controls first so risk-analysis rows can map control aliases for this sheet.
+            if 'table3' in table_ranges:
+                self._parse_prevention_measures(df, table_ranges['table3'], sheet_key=sheet_key)
+
+            if 'table2' in table_ranges:
+                self._parse_risk_analysis(df, table_ranges['table2'], sheet_key=sheet_key)
         
         # Add standard actors
         for actor_name in self.ACTOR_COLUMNS:
@@ -229,6 +253,86 @@ class ExcelParser:
             self.parsed_data.lifecycle_phases.append(LifecyclePhase(name=phase))
         
         return self.parsed_data
+
+    def _build_sheet_key(self, sheet_name: str, index: int) -> str:
+        """Create a stable sheet key used to disambiguate colliding IDs."""
+        base = re.sub(r"[^a-z0-9]+", "_", (sheet_name or "").lower()).strip("_")
+        if not base:
+            base = f"sheet_{index}"
+        base = base[:30]
+        key = base
+        suffix = 2
+        while key in self._sheet_key_tracker:
+            key = f"{base}_{suffix}"
+            suffix += 1
+        self._sheet_key_tracker.add(key)
+        return key
+
+    @staticmethod
+    def _normalize_text_key(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+    def _resolve_hazard_id(
+        self,
+        raw_id: str,
+        signature: Tuple[Any, ...],
+        sheet_key: str,
+    ) -> Tuple[str, bool]:
+        """
+        Resolve hazard ID collisions across sheets.
+        Returns (resolved_id, already_exists_with_same_signature).
+        """
+        existing = self._hazard_signatures.get(raw_id)
+        if existing is None:
+            self._hazard_signatures[raw_id] = signature
+            return raw_id, False
+        if existing == signature:
+            return raw_id, True
+
+        base = f"{raw_id}@{sheet_key}"
+        candidate = base
+        suffix = 2
+        while candidate in self._hazard_signatures and self._hazard_signatures[candidate] != signature:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+
+        already_exists = candidate in self._hazard_signatures
+        if not already_exists:
+            self._hazard_signatures[candidate] = signature
+        return candidate, already_exists
+
+    def _resolve_control_id(
+        self,
+        raw_id: str,
+        signature: Tuple[str, str],
+        sheet_key: str,
+    ) -> Tuple[str, bool]:
+        """
+        Resolve control ID collisions across sheets and remember per-sheet aliases.
+        Returns (resolved_id, already_exists_with_same_signature).
+        """
+        aliases = self._sheet_control_aliases.setdefault(sheet_key, {})
+        existing = self._control_signatures.get(raw_id)
+        if existing is None:
+            self._control_signatures[raw_id] = signature
+            aliases[raw_id] = raw_id
+            return raw_id, False
+        if existing == signature:
+            aliases[raw_id] = raw_id
+            return raw_id, True
+
+        base = f"{raw_id}@{sheet_key}"
+        candidate = base
+        suffix = 2
+        while candidate in self._control_signatures and self._control_signatures[candidate] != signature:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+
+        already_exists = candidate in self._control_signatures
+        if not already_exists:
+            self._control_signatures[candidate] = signature
+        aliases[raw_id] = candidate
+        return candidate, already_exists
     
     def _find_best_sheet(self) -> str:
         """Find the sheet with the most rows (most complete data)."""
@@ -311,13 +415,13 @@ class ExcelParser:
                 category_name = hazard_col.strip()
                 
                 # Create new category
-                category = HazardCategory(id=category_id, name=category_name)
-                exists = any(c.id == category_id for c in self.parsed_data.hazard_categories)
-                if not exists:
+                if category_id not in self._hazard_category_ids:
+                    category = HazardCategory(id=category_id, name=category_name)
                     self.parsed_data.hazard_categories.append(category)
+                    self._hazard_category_ids.add(category_id)
                 current_category = category_id
     
-    def _parse_risk_analysis(self, df: pd.DataFrame, row_range: Tuple[int, int]):
+    def _parse_risk_analysis(self, df: pd.DataFrame, row_range: Tuple[int, int], sheet_key: str):
         """Parse Table 2: Potential Hazard Assessment / Risk Analysis."""
         start, end = row_range
         
@@ -336,18 +440,15 @@ class ExcelParser:
         headers = df.iloc[header_row].tolist()
         col_map = self._map_columns(headers)
         
-        cause_counter = 0
-        consequence_counter = 0
-        
         for i in range(header_row + 1, end + 1):
             row = df.iloc[i]
             
             # Get hazard ID
-            hazard_id = str(row.iloc[col_map.get('no', 0)]) if pd.notna(row.iloc[col_map.get('no', 0)]) else ""
-            hazard_id = hazard_id.strip()
+            raw_hazard_id = str(row.iloc[col_map.get('no', 0)]) if pd.notna(row.iloc[col_map.get('no', 0)]) else ""
+            raw_hazard_id = raw_hazard_id.strip()
             
             # Skip non-hazard rows
-            if not hazard_id or not re.match(r'^\d+\.?\d*$', hazard_id):
+            if not raw_hazard_id or not re.match(r'^\d+\.?\d*$', raw_hazard_id):
                 continue
             
             # Extract hazard data
@@ -364,45 +465,74 @@ class ExcelParser:
             p_final = self._parse_int(row.iloc[col_map.get('p_final', 10)]) if col_map.get('p_final') else None
             s_final = self._parse_int(row.iloc[col_map.get('s_final', 11)]) if col_map.get('s_final') else None
             r_final = str(row.iloc[col_map.get('r_final', 12)]) if col_map.get('r_final') and pd.notna(row.iloc[col_map.get('r_final', 12)]) else ""
+
+            hazard_signature = (
+                self._normalize_text_key(hazard_name),
+                self._normalize_text_key(h_type),
+                self._normalize_text_key(q_source),
+                p_init,
+                s_init,
+                self._normalize_text_key(r_init),
+                p_final,
+                s_final,
+                self._normalize_text_key(r_final),
+            )
+            hazard_id, hazard_exists = self._resolve_hazard_id(
+                raw_hazard_id,
+                signature=hazard_signature,
+                sheet_key=sheet_key,
+            )
             
             # Create hazard
-            hazard = Hazard(
-                id=hazard_id,
-                name=hazard_name,
-                h_type=h_type,
-                q_source=q_source,
-                p_init=p_init,
-                s_init=s_init,
-                r_init=r_init,
-                p_final=p_final,
-                s_final=s_final,
-                r_final=r_final
-            )
-            self.parsed_data.hazards.append(hazard)
+            if not hazard_exists:
+                hazard = Hazard(
+                    id=hazard_id,
+                    name=hazard_name,
+                    h_type=h_type,
+                    q_source=q_source,
+                    p_init=p_init,
+                    s_init=s_init,
+                    r_init=r_init,
+                    p_final=p_final,
+                    s_final=s_final,
+                    r_final=r_final
+                )
+                self.parsed_data.hazards.append(hazard)
             
             # Extract cause
             cause_text = str(row.iloc[col_map.get('cause', 2)]) if col_map.get('cause') and pd.notna(row.iloc[col_map.get('cause', 2)]) else ""
             if cause_text and cause_text != 'nan':
-                cause_counter += 1
-                cause = Cause(id=f"C{cause_counter}", description=cause_text, hazard_id=hazard_id)
-                self.parsed_data.causes.append(cause)
+                cause_key = (hazard_id, self._normalize_text_key(cause_text))
+                if cause_key not in self._cause_keys:
+                    self._cause_counter += 1
+                    cause = Cause(id=f"C{self._cause_counter}", description=cause_text, hazard_id=hazard_id)
+                    self.parsed_data.causes.append(cause)
+                    self._cause_keys.add(cause_key)
             
             # Extract consequence
             consequence_text = str(row.iloc[col_map.get('consequence', 3)]) if col_map.get('consequence') and pd.notna(row.iloc[col_map.get('consequence', 3)]) else ""
             if consequence_text and consequence_text != 'nan':
-                consequence_counter += 1
-                consequence = Consequence(id=f"CON{consequence_counter}", description=consequence_text, hazard_id=hazard_id)
-                self.parsed_data.consequences.append(consequence)
+                consequence_key = (hazard_id, self._normalize_text_key(consequence_text))
+                if consequence_key not in self._consequence_keys:
+                    self._consequence_counter += 1
+                    consequence = Consequence(id=f"CON{self._consequence_counter}", description=consequence_text, hazard_id=hazard_id)
+                    self.parsed_data.consequences.append(consequence)
+                    self._consequence_keys.add(consequence_key)
             
             # Extract control links from prevention measures column
             prevention_text = str(row.iloc[col_map.get('prevention', 9)]) if col_map.get('prevention') and pd.notna(row.iloc[col_map.get('prevention', 9)]) else ""
-            control_ids = self._extract_control_ids(prevention_text)
+            raw_control_ids = self._extract_control_ids(prevention_text)
+            control_aliases = self._sheet_control_aliases.get(sheet_key, {})
+            control_ids = [control_aliases.get(cid, cid) for cid in raw_control_ids]
             
             # Calculate risk reduction for each control link
             p_reduction = (p_init - p_final) if p_init and p_final else None
             s_reduction = (s_init - s_final) if s_init and s_final else None
             
             for control_id in control_ids:
+                link_key = (hazard_id, control_id, p_reduction, s_reduction)
+                if link_key in self._hazard_control_keys:
+                    continue
                 link = HazardControlLink(
                     hazard_id=hazard_id, 
                     control_id=control_id,
@@ -410,26 +540,38 @@ class ExcelParser:
                     s_reduction=s_reduction
                 )
                 self.parsed_data.hazard_control_links.append(link)
+                self._hazard_control_keys.add(link_key)
             
             # Link hazard to category based on ID prefix
-            category_id = hazard_id.split('.')[0]
-            link = HazardCategoryLink(hazard_id=hazard_id, category_id=category_id)
-            self.parsed_data.hazard_category_links.append(link)
+            category_id = raw_hazard_id.split('.')[0]
+            category_key = (hazard_id, category_id)
+            if category_key not in self._hazard_category_keys:
+                link = HazardCategoryLink(hazard_id=hazard_id, category_id=category_id)
+                self.parsed_data.hazard_category_links.append(link)
+                self._hazard_category_keys.add(category_key)
             
             # Extract lifecycle phases from q_source
             lifecycle_phases = self._extract_lifecycle_phases(q_source, hazard_name, cause_text)
             for phase in lifecycle_phases:
                 self._lifecycles_found.add(phase)
+                lifecycle_key = (hazard_id, phase)
+                if lifecycle_key in self._hazard_lifecycle_keys:
+                    continue
                 link = HazardLifecycleLink(hazard_id=hazard_id, lifecycle_phase=phase)
                 self.parsed_data.hazard_lifecycle_links.append(link)
+                self._hazard_lifecycle_keys.add(lifecycle_key)
             
             # Extract actors affected (from hazard name and consequence)
             actors = self._extract_actors(hazard_name, consequence_text)
             for actor in actors:
+                actor_key = (hazard_id, actor)
+                if actor_key in self._hazard_actor_keys:
+                    continue
                 link = HazardActorLink(hazard_id=hazard_id, actor_name=actor)
                 self.parsed_data.hazard_actor_links.append(link)
+                self._hazard_actor_keys.add(actor_key)
     
-    def _parse_prevention_measures(self, df: pd.DataFrame, row_range: Tuple[int, int]):
+    def _parse_prevention_measures(self, df: pd.DataFrame, row_range: Tuple[int, int], sheet_key: str):
         """Parse Table 3: Prevention Measures (Controls)."""
         start, end = row_range
         
@@ -458,26 +600,45 @@ class ExcelParser:
             implementation_ref = str(row.iloc[2]) if len(row) > 2 and pd.notna(row.iloc[2]) else ""
             
             if description and description != 'nan':
+                control_signature = (
+                    self._normalize_text_key(description),
+                    self._normalize_text_key(implementation_ref),
+                )
+                resolved_control_id, control_exists = self._resolve_control_id(
+                    control_id,
+                    signature=control_signature,
+                    sheet_key=sheet_key,
+                )
+
                 control = Control(
-                    id=control_id,
+                    id=resolved_control_id,
                     description=description,
                     implementation_reference=implementation_ref if implementation_ref != 'nan' else ""
                 )
-                self.parsed_data.controls.append(control)
+                if not control_exists:
+                    self.parsed_data.controls.append(control)
                 
                 # Extract standards from implementation reference
                 standards = self._extract_standards(implementation_ref + " " + description)
                 for std_id in standards:
                     self._standards_found.add(std_id)
-                    link = ControlStandardLink(control_id=control_id, standard_id=std_id)
+                    std_key = (resolved_control_id, std_id)
+                    if std_key in self._control_standard_keys:
+                        continue
+                    link = ControlStandardLink(control_id=resolved_control_id, standard_id=std_id)
                     self.parsed_data.control_standard_links.append(link)
+                    self._control_standard_keys.add(std_key)
                 
                 # Extract document sections
                 doc_sections = self._extract_document_sections(implementation_ref)
                 for doc_id in doc_sections:
                     self._documents_found.add(doc_id)
-                    link = ControlDocumentLink(control_id=control_id, document_id=doc_id)
+                    doc_key = (resolved_control_id, doc_id)
+                    if doc_key in self._control_document_keys:
+                        continue
+                    link = ControlDocumentLink(control_id=resolved_control_id, document_id=doc_id)
                     self.parsed_data.control_document_links.append(link)
+                    self._control_document_keys.add(doc_key)
     
     def _map_columns(self, headers: List) -> Dict[str, int]:
         """Map column headers to indices."""

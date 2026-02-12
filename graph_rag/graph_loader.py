@@ -8,13 +8,28 @@ Implements full scope requirements including:
 - Contextual links to standards, instructions, and lifecycle stages
 - Shared controls tracking
 """
-from typing import Optional
+from typing import Optional, Tuple
 from neo4j import GraphDatabase
 from excel_parser import ParsedData
 import sys
 import os
+import re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+
+
+def normalize_product_key(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def derive_product_from_source(source_name: str) -> Tuple[str, str]:
+    candidate = source_name or ""
+    if "::" in candidate:
+        candidate = candidate.split("::", 1)[1]
+    stem = os.path.splitext(os.path.basename(candidate))[0]
+    product_name = re.sub(r"\s+", " ", re.sub(r"[_-]+", " ", stem)).strip() or "Unknown Product"
+    return product_name, normalize_product_key(product_name)
 
 
 class GraphLoader:
@@ -25,6 +40,8 @@ class GraphLoader:
         self.user = user or config.NEO4J_USER
         self.password = password or config.NEO4J_PASSWORD
         self.driver = None
+        self._current_product_name = "Unknown Product"
+        self._current_product_key = "unknown product"
     
     def connect(self):
         """Establish connection to Neo4j."""
@@ -43,14 +60,40 @@ class GraphLoader:
         """Clear all nodes and relationships from the database."""
         with self.driver.session() as session:
             session.run("MATCH (n) DETACH DELETE n")
+
+    def _uid(self, base_id: str) -> str:
+        return f"{self._current_product_key}::{base_id}"
+
+    def _drop_legacy_id_constraints(self):
+        """Drop old per-id uniqueness constraints so product-scoped IDs can coexist."""
+        query = """
+        SHOW CONSTRAINTS
+        YIELD name, type, labelsOrTypes, properties
+        WHERE type CONTAINS 'UNIQUENESS'
+          AND size(labelsOrTypes) = 1
+          AND size(properties) = 1
+          AND labelsOrTypes[0] IN ['Hazard', 'Control', 'Cause', 'Consequence']
+          AND properties[0] = 'id'
+        RETURN name
+        """
+        try:
+            with self.driver.session() as session:
+                for row in session.run(query):
+                    name = row["name"]
+                    safe_name = str(name).replace("`", "")
+                    session.run(f"DROP CONSTRAINT `{safe_name}`")
+        except Exception:
+            # Continue even if constraint introspection isn't available.
+            pass
     
     def create_constraints(self):
         """Create uniqueness constraints for node IDs."""
+        self._drop_legacy_id_constraints()
         constraints = [
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (h:Hazard) REQUIRE h.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Control) REQUIRE c.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (ca:Cause) REQUIRE ca.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (co:Consequence) REQUIRE co.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (h:Hazard) REQUIRE h.uid IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Control) REQUIRE c.uid IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (ca:Cause) REQUIRE ca.uid IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (co:Consequence) REQUIRE co.uid IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (hc:HazardCategory) REQUIRE hc.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Actor) REQUIRE a.name IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Standard) REQUIRE s.id IS UNIQUE",
@@ -66,10 +109,14 @@ class GraphLoader:
                     # Constraint might already exist
                     pass
     
-    def load_data(self, data: ParsedData, progress_callback=None):
+    def load_data(self, data: ParsedData, source_name: str = "", progress_callback=None):
         """Load all parsed data into Neo4j."""
         total_steps = 14
         current_step = 0
+
+        product_name, product_key = derive_product_from_source(source_name)
+        self._current_product_name = product_name
+        self._current_product_key = product_key or "unknown product"
         
         def update_progress(message: str):
             nonlocal current_step
@@ -195,14 +242,20 @@ class GraphLoader:
         """Load Control nodes."""
         query = """
         UNWIND $controls AS ctrl
-        MERGE (c:Control {id: ctrl.id})
+        MERGE (c:Control {uid: ctrl.uid})
         SET c.description = ctrl.description,
+            c.id = ctrl.id,
+            c.product_name = ctrl.product_name,
+            c.product_key = ctrl.product_key,
             c.implementation_reference = ctrl.implementation_reference
         """
         with self.driver.session() as session:
             session.run(query, controls=[
                 {
+                    "uid": self._uid(c.id),
                     "id": c.id,
+                    "product_name": self._current_product_name,
+                    "product_key": self._current_product_key,
                     "description": c.description,
                     "implementation_reference": c.implementation_reference
                 } for c in controls
@@ -213,8 +266,11 @@ class GraphLoader:
         # First, create/update hazards with non-empty names
         query_with_name = """
         UNWIND $hazards AS h
-        MERGE (haz:Hazard {id: h.id})
+        MERGE (haz:Hazard {uid: h.uid})
         SET haz.name = CASE WHEN h.name IS NOT NULL AND h.name <> '' THEN h.name ELSE haz.name END,
+            haz.id = h.id,
+            haz.product_name = h.product_name,
+            haz.product_key = h.product_key,
             haz.h_type = CASE WHEN h.h_type IS NOT NULL AND h.h_type <> '' THEN h.h_type ELSE haz.h_type END,
             haz.q_source = CASE WHEN h.q_source IS NOT NULL AND h.q_source <> '' THEN h.q_source ELSE haz.q_source END,
             haz.p_init = COALESCE(h.p_init, haz.p_init),
@@ -227,7 +283,10 @@ class GraphLoader:
         with self.driver.session() as session:
             session.run(query_with_name, hazards=[
                 {
+                    "uid": self._uid(h.id),
                     "id": h.id,
+                    "product_name": self._current_product_name,
+                    "product_key": self._current_product_key,
                     "name": h.name if h.name and h.name != 'nan' else None,
                     "h_type": h.h_type if h.h_type and h.h_type != 'nan' else None,
                     "q_source": h.q_source if h.q_source and h.q_source != 'nan' else None,
@@ -244,16 +303,23 @@ class GraphLoader:
         """Load Cause nodes and link to hazards."""
         query = """
         UNWIND $causes AS c
-        MERGE (ca:Cause {id: c.id})
-        SET ca.description = c.description
+        MERGE (ca:Cause {uid: c.uid})
+        SET ca.description = c.description,
+            ca.id = c.id,
+            ca.product_name = c.product_name,
+            ca.product_key = c.product_key
         WITH ca, c
-        MATCH (h:Hazard {id: c.hazard_id})
+        MATCH (h:Hazard {uid: c.hazard_uid})
         MERGE (h)-[:HAS_CAUSE]->(ca)
         """
         with self.driver.session() as session:
             session.run(query, causes=[
                 {
+                    "uid": self._uid(c.id),
                     "id": c.id,
+                    "hazard_uid": self._uid(c.hazard_id),
+                    "product_name": self._current_product_name,
+                    "product_key": self._current_product_key,
                     "description": c.description,
                     "hazard_id": c.hazard_id
                 } for c in causes
@@ -263,16 +329,23 @@ class GraphLoader:
         """Load Consequence nodes and link to hazards."""
         query = """
         UNWIND $consequences AS c
-        MERGE (co:Consequence {id: c.id})
-        SET co.description = c.description
+        MERGE (co:Consequence {uid: c.uid})
+        SET co.description = c.description,
+            co.id = c.id,
+            co.product_name = c.product_name,
+            co.product_key = c.product_key
         WITH co, c
-        MATCH (h:Hazard {id: c.hazard_id})
+        MATCH (h:Hazard {uid: c.hazard_uid})
         MERGE (h)-[:HAS_CONSEQUENCE]->(co)
         """
         with self.driver.session() as session:
             session.run(query, consequences=[
                 {
+                    "uid": self._uid(c.id),
                     "id": c.id,
+                    "hazard_uid": self._uid(c.hazard_id),
+                    "product_name": self._current_product_name,
+                    "product_key": self._current_product_key,
                     "description": c.description,
                     "hazard_id": c.hazard_id
                 } for c in consequences
@@ -282,17 +355,23 @@ class GraphLoader:
         """Create MITIGATED_BY relationships with risk reduction properties."""
         query = """
         UNWIND $links AS link
-        MATCH (h:Hazard {id: link.hazard_id})
-        MATCH (c:Control {id: link.control_id})
+        MATCH (h:Hazard {uid: link.hazard_uid})
+        MATCH (c:Control {uid: link.control_uid})
         MERGE (h)-[r:MITIGATED_BY]->(c)
         SET r.p_reduction = link.p_reduction,
-            r.s_reduction = link.s_reduction
+            r.s_reduction = link.s_reduction,
+            r.product_name = link.product_name,
+            r.product_key = link.product_key
         """
         with self.driver.session() as session:
             session.run(query, links=[
                 {
                     "hazard_id": l.hazard_id, 
                     "control_id": l.control_id,
+                    "hazard_uid": self._uid(l.hazard_id),
+                    "control_uid": self._uid(l.control_id),
+                    "product_name": self._current_product_name,
+                    "product_key": self._current_product_key,
                     "p_reduction": l.p_reduction,
                     "s_reduction": l.s_reduction
                 }
@@ -303,13 +382,17 @@ class GraphLoader:
         """Create CONTAINS relationships between categories and hazards."""
         query = """
         UNWIND $links AS link
-        MATCH (h:Hazard {id: link.hazard_id})
+        MATCH (h:Hazard {uid: link.hazard_uid})
         MATCH (hc:HazardCategory {id: link.category_id})
         MERGE (hc)-[:CONTAINS]->(h)
         """
         with self.driver.session() as session:
             session.run(query, links=[
-                {"hazard_id": l.hazard_id, "category_id": l.category_id}
+                {
+                    "hazard_id": l.hazard_id,
+                    "hazard_uid": self._uid(l.hazard_id),
+                    "category_id": l.category_id,
+                }
                 for l in links
             ])
     
@@ -317,13 +400,17 @@ class GraphLoader:
         """Create AFFECTS relationships between hazards and actors."""
         query = """
         UNWIND $links AS link
-        MATCH (h:Hazard {id: link.hazard_id})
+        MATCH (h:Hazard {uid: link.hazard_uid})
         MATCH (a:Actor {name: link.actor_name})
         MERGE (h)-[:AFFECTS]->(a)
         """
         with self.driver.session() as session:
             session.run(query, links=[
-                {"hazard_id": l.hazard_id, "actor_name": l.actor_name}
+                {
+                    "hazard_id": l.hazard_id,
+                    "hazard_uid": self._uid(l.hazard_id),
+                    "actor_name": l.actor_name,
+                }
                 for l in links
             ])
     
@@ -331,13 +418,17 @@ class GraphLoader:
         """Create OCCURS_DURING relationships between hazards and lifecycle phases."""
         query = """
         UNWIND $links AS link
-        MATCH (h:Hazard {id: link.hazard_id})
+        MATCH (h:Hazard {uid: link.hazard_uid})
         MATCH (l:LifecyclePhase {name: link.lifecycle_phase})
         MERGE (h)-[:OCCURS_DURING]->(l)
         """
         with self.driver.session() as session:
             session.run(query, links=[
-                {"hazard_id": l.hazard_id, "lifecycle_phase": l.lifecycle_phase}
+                {
+                    "hazard_id": l.hazard_id,
+                    "hazard_uid": self._uid(l.hazard_id),
+                    "lifecycle_phase": l.lifecycle_phase,
+                }
                 for l in links
             ])
     
@@ -345,13 +436,17 @@ class GraphLoader:
         """Create REFERENCES relationships between controls and standards."""
         query = """
         UNWIND $links AS link
-        MATCH (c:Control {id: link.control_id})
+        MATCH (c:Control {uid: link.control_uid})
         MATCH (s:Standard {id: link.standard_id})
         MERGE (c)-[:REFERENCES]->(s)
         """
         with self.driver.session() as session:
             session.run(query, links=[
-                {"control_id": l.control_id, "standard_id": l.standard_id}
+                {
+                    "control_id": l.control_id,
+                    "control_uid": self._uid(l.control_id),
+                    "standard_id": l.standard_id,
+                }
                 for l in links
             ])
     
@@ -359,13 +454,17 @@ class GraphLoader:
         """Create DOCUMENTED_IN relationships between controls and document sections."""
         query = """
         UNWIND $links AS link
-        MATCH (c:Control {id: link.control_id})
+        MATCH (c:Control {uid: link.control_uid})
         MATCH (d:DocumentSection {id: link.document_id})
         MERGE (c)-[:DOCUMENTED_IN]->(d)
         """
         with self.driver.session() as session:
             session.run(query, links=[
-                {"control_id": l.control_id, "document_id": l.document_id}
+                {
+                    "control_id": l.control_id,
+                    "control_uid": self._uid(l.control_id),
+                    "document_id": l.document_id,
+                }
                 for l in links
             ])
     
@@ -403,6 +502,7 @@ class GraphLoader:
 
 def load_to_neo4j(data: ParsedData, uri: str = None, user: str = None, 
                   password: str = None, clear_existing: bool = True,
+                  source_name: str = "",
                   progress_callback=None) -> dict:
     """Convenience function to load data into Neo4j."""
     loader = GraphLoader(uri, user, password)
@@ -413,7 +513,7 @@ def load_to_neo4j(data: ParsedData, uri: str = None, user: str = None,
         if clear_existing:
             loader.clear_database()
         
-        loader.load_data(data, progress_callback)
+        loader.load_data(data, source_name=source_name, progress_callback=progress_callback)
         stats = loader.get_statistics()
         
         return stats

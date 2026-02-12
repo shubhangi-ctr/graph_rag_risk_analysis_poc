@@ -74,7 +74,10 @@ class GraphChromaStore:
             ids: List[str] = []
 
             for d, m in zip(docs, metas):
-                prefix = f"{m.get('source','')}|{m.get('doc_type','')}|{m.get('id','')}"
+                prefix = (
+                    f"{m.get('source','')}|{m.get('product_key','')}|"
+                    f"{m.get('doc_type','')}|{m.get('id','')}"
+                )
                 ids.append(_sha_id(prefix, d))
 
             embs = self.embed_texts(oai, docs, model=embedding_model)
@@ -89,13 +92,17 @@ class GraphChromaStore:
         query_text: str,
         embedding_model: str,
         top_k: int,
+        metadata_filter: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         q_emb = self.embed_texts(oai, [query_text], model=embedding_model)[0]
-        res = self.collection.query(
+        query_kwargs: Dict[str, Any] = dict(
             query_embeddings=[q_emb],
             n_results=top_k,
             include=["documents", "metadatas", "distances"],
         )
+        if metadata_filter:
+            query_kwargs["where"] = metadata_filter
+        res = self.collection.query(**query_kwargs)
 
         hits: List[Dict[str, Any]] = []
         for i in range(len(res["ids"][0])):
@@ -108,6 +115,37 @@ class GraphChromaStore:
                 }
             )
         return hits
+
+    def list_products(self) -> List[Dict[str, str]]:
+        total = self.count()
+        if total <= 0:
+            return []
+
+        res = self.collection.get(limit=total, include=["metadatas"])
+        products_by_key: Dict[str, str] = {}
+        for meta in res.get("metadatas", []):
+            if not isinstance(meta, dict):
+                continue
+            product_key = str(meta.get("product_key") or "").strip()
+            product_name = str(meta.get("product_name") or "").strip()
+            if not product_key:
+                continue
+            if product_key not in products_by_key:
+                products_by_key[product_key] = product_name or product_key
+
+        products = [{"product_key": k, "product_name": v} for k, v in products_by_key.items()]
+        products.sort(key=lambda item: item["product_name"].lower())
+        return products
+
+    def has_metadata_field(self, field_name: str) -> bool:
+        total = self.count()
+        if total <= 0:
+            return False
+        res = self.collection.get(limit=total, include=["metadatas"])
+        for meta in res.get("metadatas", []):
+            if isinstance(meta, dict) and meta.get(field_name):
+                return True
+        return False
 
 
 def _build_hazard_documents(session, source_name: str) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -131,6 +169,8 @@ def _build_hazard_documents(session, source_name: str) -> Tuple[List[str], List[
     WITH h, causes, consequences, mitigations, actors, collect(DISTINCT l.name) AS lifecycle_phases
     OPTIONAL MATCH (hc:HazardCategory)-[:CONTAINS]->(h)
     RETURN
+        h.product_name AS product_name,
+        h.product_key AS product_key,
         h.id AS hazard_id,
         h.name AS hazard_name,
         h.h_type AS hazard_type,
@@ -147,7 +187,7 @@ def _build_hazard_documents(session, source_name: str) -> Tuple[List[str], List[
         [x IN lifecycle_phases WHERE x IS NOT NULL] AS lifecycle_phases,
         [x IN collect(DISTINCT hc.name) WHERE x IS NOT NULL] AS categories,
         [x IN mitigations WHERE x.control_id IS NOT NULL] AS mitigations
-    ORDER BY hazard_id
+    ORDER BY product_name, hazard_id
     """
 
     documents: List[str] = []
@@ -167,6 +207,7 @@ def _build_hazard_documents(session, source_name: str) -> Tuple[List[str], List[
             )
 
         lines = [
+            f"Product: {row.get('product_name')}" if row.get("product_name") else "",
             f"Hazard {row.get('hazard_id')}: {row.get('hazard_name') or 'Unknown'}",
             f"Type: {row.get('hazard_type')}" if row.get("hazard_type") else "",
             f"Source/Section: {row.get('source_section')}" if row.get("source_section") else "",
@@ -194,6 +235,8 @@ def _build_hazard_documents(session, source_name: str) -> Tuple[List[str], List[
                 "source": source_name,
                 "doc_type": "graph_hazard_chunk",
                 "id": row.get("hazard_id"),
+                "product_name": row.get("product_name"),
+                "product_key": row.get("product_key"),
                 "hazard_id": row.get("hazard_id"),
                 "hazard_name": row.get("hazard_name"),
             }
@@ -211,19 +254,22 @@ def _build_control_documents(session, source_name: str) -> Tuple[List[str], List
     WITH c, hazard_ids, collect(DISTINCT s.id) AS standard_ids
     OPTIONAL MATCH (c)-[:DOCUMENTED_IN]->(d:DocumentSection)
     RETURN
+        c.product_name AS product_name,
+        c.product_key AS product_key,
         c.id AS control_id,
         c.description AS control_description,
         c.implementation_reference AS implementation_reference,
         [x IN hazard_ids WHERE x IS NOT NULL] AS hazard_ids,
         [x IN standard_ids WHERE x IS NOT NULL] AS standard_ids,
         [x IN collect(DISTINCT d.id) WHERE x IS NOT NULL] AS document_ids
-    ORDER BY control_id
+    ORDER BY product_name, control_id
     """
 
     documents: List[str] = []
     metadatas: List[Dict[str, Any]] = []
     for row in session.run(query):
         lines = [
+            f"Product: {row.get('product_name')}" if row.get("product_name") else "",
             f"Control {row.get('control_id')}: {row.get('control_description') or ''}",
             (
                 f"Implementation reference: {row.get('implementation_reference')}"
@@ -241,6 +287,8 @@ def _build_control_documents(session, source_name: str) -> Tuple[List[str], List
                 "source": source_name,
                 "doc_type": "graph_control_chunk",
                 "id": row.get("control_id"),
+                "product_name": row.get("product_name"),
+                "product_key": row.get("product_key"),
                 "control_id": row.get("control_id"),
             }
         )

@@ -4,6 +4,8 @@ Converts natural language questions to Cypher queries using LLM and executes the
 Supports full scope requirements including all node types and relationships.
 """
 import os
+import re
+from difflib import SequenceMatcher
 from typing import List, Dict, Any, Tuple
 from neo4j import GraphDatabase
 from openai import OpenAI
@@ -38,6 +40,12 @@ class QueryEngine:
         self.client = None
         self.graph_store = None
         self.prompt_template = self._load_prompt_template()
+        self.indexed_products: List[Dict[str, str]] = []
+
+    @staticmethod
+    def _normalize_product_key(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+        return re.sub(r"\s+", " ", cleaned)
     
     def _load_prompt_template(self) -> str:
         """Load the Cypher prompt template."""
@@ -62,6 +70,7 @@ class QueryEngine:
 
         if self.openai_api_key:
             self.client = OpenAI(api_key=self.openai_api_key)
+        self._refresh_product_catalog()
         
         return True
     
@@ -70,7 +79,132 @@ class QueryEngine:
         if self.driver:
             self.driver.close()
     
-    def retrieve_graph_chunks(self, question: str, top_k: int = None) -> List[Dict[str, Any]]:
+    def _refresh_product_catalog(self) -> None:
+        try:
+            self.indexed_products = self.graph_store.list_products() if self.graph_store else []
+        except Exception:
+            self.indexed_products = []
+
+    def _detect_product_filter(self, question: str) -> Dict[str, str] | None:
+        if not self.indexed_products:
+            self._refresh_product_catalog()
+        if not self.indexed_products:
+            return None
+
+        normalized_question = f" {self._normalize_product_key(question)} "
+        if normalized_question.strip() == "":
+            return None
+
+        matches: List[Tuple[int, Dict[str, str]]] = []
+        for product in self.indexed_products:
+            product_key = (product.get("product_key") or "").strip()
+            product_name = (product.get("product_name") or "").strip()
+            aliases = {product_key, self._normalize_product_key(product_name)}
+
+            for alias in aliases:
+                if not alias:
+                    continue
+                pattern = rf"(^|\s){re.escape(alias)}(\s|$)"
+                if re.search(pattern, normalized_question):
+                    matches.append((len(alias), product))
+                    break
+
+        if not matches:
+            q_tokens = [t for t in self._normalize_product_key(question).split(" ") if t]
+            fuzzy_matches: List[Tuple[float, Dict[str, str]]] = []
+            for product in self.indexed_products:
+                alias = (product.get("product_key") or self._normalize_product_key(product.get("product_name", ""))).strip()
+                p_tokens = [t for t in alias.split(" ") if t]
+                if not p_tokens:
+                    continue
+
+                matched = 0
+                for p_tok in p_tokens:
+                    if p_tok in q_tokens:
+                        matched += 1
+                        continue
+                    if any(SequenceMatcher(None, p_tok, q_tok).ratio() >= 0.84 for q_tok in q_tokens):
+                        matched += 1
+
+                coverage = matched / len(p_tokens)
+                if coverage >= 0.75 and matched >= max(1, len(p_tokens) - 1):
+                    fuzzy_matches.append((coverage, product))
+
+            if not fuzzy_matches:
+                return None
+
+            fuzzy_matches.sort(key=lambda item: item[0], reverse=True)
+            best_score = fuzzy_matches[0][0]
+            top_fuzzy = [product for score, product in fuzzy_matches if score == best_score]
+            top_keys = {p.get("product_key", "") for p in top_fuzzy}
+            if len(top_keys) > 1:
+                return None
+            return top_fuzzy[0]
+
+        matches.sort(key=lambda item: item[0], reverse=True)
+        longest = matches[0][0]
+        top_matches = [product for size, product in matches if size == longest]
+        top_keys = {p.get("product_key", "") for p in top_matches}
+        if len(top_keys) > 1:
+            return None
+        return top_matches[0]
+
+    def _is_cross_product_query(self, question: str) -> bool:
+        """Detect when user explicitly asks for results across products."""
+        q = self._normalize_product_key(question)
+        patterns = [
+            r"\ball products\b",
+            r"\bacross products\b",
+            r"\bmultiple products\b",
+            r"\beach product\b",
+            r"\bper product\b",
+            r"\bby product\b",
+        ]
+        return any(re.search(p, q) for p in patterns)
+
+    def _retrieve_diverse_graph_chunks(self, question: str, top_k: int) -> List[Dict[str, Any]]:
+        """
+        Retrieve chunks with product diversity for cross-product questions.
+        This avoids top-k collapsing onto only one product.
+        """
+        expanded_k = max(top_k * 4, 24)
+        raw_hits = self.graph_store.query(
+            oai=self.client,
+            query_text=question,
+            embedding_model=config.OPENAI_EMBEDDING_MODEL,
+            top_k=expanded_k,
+            metadata_filter=None,
+        )
+        if not raw_hits:
+            return []
+
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+        order: List[str] = []
+        for hit in raw_hits:
+            meta = hit.get("meta") or {}
+            key = str(meta.get("product_key") or "__unknown__")
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append(hit)
+
+        # Sort products by best distance first, then round-robin selection.
+        order.sort(key=lambda k: (buckets[k][0].get("distance") if buckets[k] else 10**9))
+        selected: List[Dict[str, Any]] = []
+        idx = 0
+        while len(selected) < top_k and any(idx < len(buckets[k]) for k in order):
+            for k in order:
+                if idx < len(buckets[k]) and len(selected) < top_k:
+                    selected.append(buckets[k][idx])
+            idx += 1
+        return selected
+
+    def retrieve_graph_chunks(
+        self,
+        question: str,
+        top_k: int = None,
+        metadata_filter: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         """Retrieve relevant graph knowledge chunks from Chroma."""
         if not self.client:
             raise ValueError("OpenAI client not initialized. Please provide API key.")
@@ -82,6 +216,7 @@ class QueryEngine:
             query_text=question,
             embedding_model=config.OPENAI_EMBEDDING_MODEL,
             top_k=top_k or self.graph_top_k,
+            metadata_filter=metadata_filter,
         )
 
     def _format_graph_context(self, chunks: List[Dict[str, Any]]) -> str:
@@ -99,13 +234,20 @@ class QueryEngine:
                 "\n".join(
                     [
                         f"[chunk={i}] source={meta.get('source','')} doc_type={meta.get('doc_type','')} id={meta.get('id','')} distance={hit.get('distance')}",
+                        f"product={meta.get('product_name','')}",
                         text,
                     ]
                 )
             )
         return "\n\n---\n\n".join(blocks)
 
-    def generate_cypher(self, question: str, context_chunks: List[Dict[str, Any]] = None) -> str:
+    def generate_cypher(
+        self,
+        question: str,
+        context_chunks: List[Dict[str, Any]] = None,
+        product_filter: Dict[str, str] | None = None,
+        cross_product: bool = False,
+    ) -> str:
         """Generate Cypher query from natural language + retrieved graph context."""
         if not self.client:
             raise ValueError("OpenAI client not initialized. Please provide API key.")
@@ -117,6 +259,18 @@ class QueryEngine:
                 "\n\n## Retrieved Knowledge Graph Context\n"
                 "Use this evidence to choose correct labels/properties and narrow filters.\n"
                 f"{graph_context}"
+            )
+        if product_filter and product_filter.get("product_key"):
+            prompt += (
+                "\n\n## Mandatory Product Scope\n"
+                f"Restrict query to product_key = '{product_filter['product_key']}'. "
+                "Apply this filter to all Hazard/Control/Cause/Consequence matches."
+            )
+        if cross_product:
+            prompt += (
+                "\n\n## Mandatory Cross-Product Scope\n"
+                "Do NOT filter to a single product_key. Return results across all products. "
+                "Include product_name or product_key in returned fields, grouped per product when relevant."
             )
         
         response = self.client.chat.completions.create(
@@ -137,6 +291,37 @@ class QueryEngine:
             cypher = '\n'.join(lines[1:-1] if lines[-1] == '```' else lines[1:])
         
         return cypher
+
+    def _apply_product_scope_to_cypher(self, cypher: str, product_key: str) -> str:
+        """Best-effort guardrail: inject product filter into relevant MATCH clauses."""
+        if not cypher or not product_key:
+            return cypher
+        if "product_key" in cypher:
+            return cypher
+
+        pattern = re.compile(r"\((\w+)\s*:\s*(Hazard|Control|Cause|Consequence)\b")
+        scoped_lines = cypher.splitlines()
+        for i, line in enumerate(scoped_lines):
+            aliases = [m.group(1) for m in pattern.finditer(line)]
+            if aliases and re.search(r"\bMATCH\b", line, flags=re.IGNORECASE):
+                clause = " AND ".join([f"{alias}.product_key = '{product_key}'" for alias in aliases])
+                if re.search(r"\bWHERE\b", line, flags=re.IGNORECASE):
+                    scoped_lines[i] = f"{line} AND {clause}"
+                else:
+                    # Handle multiline style: MATCH (...) \n WHERE ...
+                    next_where_idx = None
+                    for j in range(i + 1, len(scoped_lines)):
+                        if scoped_lines[j].strip() == "":
+                            continue
+                        if re.search(r"^\s*WHERE\b", scoped_lines[j], flags=re.IGNORECASE):
+                            next_where_idx = j
+                        break
+
+                    if next_where_idx is not None:
+                        scoped_lines[next_where_idx] = f"{scoped_lines[next_where_idx]} AND {clause}"
+                    else:
+                        scoped_lines[i] = f"{line} WHERE {clause}"
+        return "\n".join(scoped_lines)
     
     def execute_cypher(self, cypher: str) -> List[Dict[str, Any]]:
         """Execute a Cypher query and return results."""
@@ -245,13 +430,46 @@ Provide a helpful, conversational answer that summarizes the key findings. Inclu
         Returns: (cypher_query, raw_results, formatted_answer, retrieved_chunks)
         """
         chunks: List[Dict[str, Any]] = []
+        cross_product = self._is_cross_product_query(question)
+        product = None if cross_product else self._detect_product_filter(question)
+        metadata_filter = None
+        if product and product.get("product_key"):
+            metadata_filter = {"product_key": product["product_key"]}
         try:
-            chunks = self.retrieve_graph_chunks(question, top_k=self.graph_top_k)
+            if cross_product:
+                chunks = self._retrieve_diverse_graph_chunks(question, top_k=self.graph_top_k)
+            else:
+                chunks = self.retrieve_graph_chunks(
+                    question,
+                    top_k=self.graph_top_k,
+                    metadata_filter=metadata_filter,
+                )
         except Exception:
             # Retrieval failure should not block query execution.
             chunks = []
 
-        cypher = self.generate_cypher(question, context_chunks=chunks)
+        cypher = self.generate_cypher(
+            question,
+            context_chunks=chunks,
+            product_filter=product,
+            cross_product=cross_product,
+        )
+        if metadata_filter:
+            cypher = self._apply_product_scope_to_cypher(cypher, metadata_filter["product_key"])
+        elif cross_product and "product_key" in cypher:
+            # Retry once with a stronger no-filter hint if model over-scopes.
+            retry_question = (
+                question
+                + " IMPORTANT: return results for all products, do not use product_key='...'."
+            )
+            cypher_retry = self.generate_cypher(
+                retry_question,
+                context_chunks=chunks,
+                product_filter=None,
+                cross_product=True,
+            )
+            if "product_key" not in cypher_retry:
+                cypher = cypher_retry
         
         if cypher.startswith("// Cannot answer"):
             return cypher, [], cypher.replace("// ", ""), chunks
@@ -294,6 +512,10 @@ Provide a helpful, conversational answer that summarizes the key findings. Inclu
             {
                 "question": "What is the average risk reduction achieved by each control?",
                 "description": "Control effectiveness analysis"
+            },
+            {
+                "question": "For Incubators, list high residual risk hazards only for that product",
+                "description": "Product-scoped Graph RAG query"
             },
             {
                 "question": "Which controls are documented in the Operating Instructions?",

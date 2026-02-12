@@ -11,6 +11,8 @@ All docs have metadata for UI citations.
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
@@ -23,6 +25,27 @@ from excel_parser import ParsedData
 def _sha_id(prefix: str, text: str) -> str:
     h = hashlib.sha1((prefix + "|" + text).encode("utf-8", errors="ignore")).hexdigest()
     return f"{prefix}:{h[:12]}"
+
+
+def normalize_product_key(value: str) -> str:
+    """Normalize product text for metadata filtering and matching."""
+    cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def derive_product_from_source(source_name: str) -> Tuple[str, str]:
+    """
+    Derive a product label/key from source file path.
+    Example:
+      "Risk.zip::Risk Analysis Files/Controlled rate freezer.xlsx"
+      -> ("Controlled rate freezer", "controlled rate freezer")
+    """
+    candidate = source_name or ""
+    if "::" in candidate:
+        candidate = candidate.split("::", 1)[1]
+    stem = os.path.splitext(os.path.basename(candidate))[0]
+    product_name = re.sub(r"\s+", " ", re.sub(r"[_-]+", " ", stem)).strip() or "Unknown Product"
+    return product_name, normalize_product_key(product_name)
 
 
 class ChromaVectorStore:
@@ -79,13 +102,17 @@ class ChromaVectorStore:
         query_text: str,
         embedding_model: str,
         top_k: int,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         q_emb = self.embed_texts(oai, [query_text], model=embedding_model)[0]
-        res = self.collection.query(
+        query_kwargs: Dict[str, Any] = dict(
             query_embeddings=[q_emb],
             n_results=top_k,
             include=["documents", "metadatas", "distances"],
         )
+        if metadata_filter:
+            query_kwargs["where"] = metadata_filter
+        res = self.collection.query(**query_kwargs)
 
         hits: List[Dict[str, Any]] = []
         for i in range(len(res["ids"][0])):
@@ -99,9 +126,44 @@ class ChromaVectorStore:
             )
         return hits
 
+    def list_products(self) -> List[Dict[str, str]]:
+        """Return unique indexed products discovered in metadata."""
+        total = self.count()
+        if total <= 0:
+            return []
+
+        res = self.collection.get(limit=total, include=["metadatas"])
+        products_by_key: Dict[str, str] = {}
+        for meta in res.get("metadatas", []):
+            if not isinstance(meta, dict):
+                continue
+            product_key = str(meta.get("product_key") or "").strip()
+            product_name = str(meta.get("product_name") or "").strip()
+            if not product_key:
+                continue
+            if product_key not in products_by_key:
+                products_by_key[product_key] = product_name or product_key
+
+        products = [{"product_key": k, "product_name": v} for k, v in products_by_key.items()]
+        products.sort(key=lambda item: item["product_name"].lower())
+        return products
+
+    def has_metadata_field(self, field_name: str) -> bool:
+        """Check if at least one indexed document has a given metadata field."""
+        total = self.count()
+        if total <= 0:
+            return False
+        res = self.collection.get(limit=total, include=["metadatas"])
+        for meta in res.get("metadatas", []):
+            if isinstance(meta, dict) and meta.get(field_name):
+                return True
+        return False
+
 
 def build_rag_documents(data: ParsedData, source_name: str) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, int]]:
     """Convert ParsedData graph objects to textual documents for vector RAG."""
+    product_name, product_key = derive_product_from_source(source_name)
+
     # Index controls by id for easy lookup
     controls_by_id = {c.id: c for c in data.controls}
     standards_by_id = {s.id: s for s in data.standards}
@@ -195,6 +257,8 @@ def build_rag_documents(data: ParsedData, source_name: str) -> Tuple[List[str], 
         metadatas.append(
             {
                 "source": source_name,
+                "product_name": product_name,
+                "product_key": product_key,
                 "doc_type": "hazard",
                 "id": h.id,
                 "hazard_id": h.id,
@@ -230,6 +294,8 @@ def build_rag_documents(data: ParsedData, source_name: str) -> Tuple[List[str], 
         metadatas.append(
             {
                 "source": source_name,
+                "product_name": product_name,
+                "product_key": product_key,
                 "doc_type": "control",
                 "id": c.id,
                 "control_id": c.id,
@@ -240,19 +306,43 @@ def build_rag_documents(data: ParsedData, source_name: str) -> Tuple[List[str], 
     for s in data.standards:
         text = f"Standard {s.id}: {s.name}"
         documents.append(text)
-        metadatas.append({"source": source_name, "doc_type": "standard", "id": s.id})
+        metadatas.append(
+            {
+                "source": source_name,
+                "product_name": product_name,
+                "product_key": product_key,
+                "doc_type": "standard",
+                "id": s.id,
+            }
+        )
 
     # --- Document sections (light) ---
     for d in data.document_sections:
         text = f"DocumentSection {d.id}: {d.name} (type: {d.document_type})" if d.document_type else f"DocumentSection {d.id}: {d.name}"
         documents.append(text)
-        metadatas.append({"source": source_name, "doc_type": "document_section", "id": d.id})
+        metadatas.append(
+            {
+                "source": source_name,
+                "product_name": product_name,
+                "product_key": product_key,
+                "doc_type": "document_section",
+                "id": d.id,
+            }
+        )
 
     # --- Lifecycle phases (light) ---
     for l in data.lifecycle_phases:
         text = f"LifecyclePhase: {l.name}"
         documents.append(text)
-        metadatas.append({"source": source_name, "doc_type": "lifecycle_phase", "id": l.name})
+        metadatas.append(
+            {
+                "source": source_name,
+                "product_name": product_name,
+                "product_key": product_key,
+                "doc_type": "lifecycle_phase",
+                "id": l.name,
+            }
+        )
 
     stats = {
         "hazards": len(data.hazards),
@@ -263,5 +353,6 @@ def build_rag_documents(data: ParsedData, source_name: str) -> Tuple[List[str], 
         "document_sections": len(data.document_sections),
         "lifecycle_phases": len(data.lifecycle_phases),
         "vector_docs": len(documents),
+        "product_name": product_name,
     }
     return documents, metadatas, stats
