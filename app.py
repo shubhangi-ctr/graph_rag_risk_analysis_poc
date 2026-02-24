@@ -74,6 +74,8 @@ def init_session_state():
         'graph_stats': None,
         'trad_stats': None,
         'data_bootstrap_done': False,
+        'pending_clarification': None,
+        'clarification_mode': True,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -682,6 +684,642 @@ def fetch_subgraph_for_query_results(query_engine, original_cypher: str):
         return [], [], ""
 
 
+# ==================== QUESTION CLARIFICATION ====================
+
+def _parse_json_object(raw_text: str) -> Dict[str, Any]:
+    """Parse a JSON object from model output safely."""
+    text = (raw_text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _get_llm_client_for_clarification():
+    """Reuse an already-initialized OpenAI client from either engine."""
+    trad_engine = st.session_state.get("trad_query_engine")
+    if trad_engine and getattr(trad_engine, "client", None):
+        return trad_engine.client
+
+    graph_engine = st.session_state.get("graph_query_engine")
+    if graph_engine and getattr(graph_engine, "client", None):
+        return graph_engine.client
+    return None
+
+
+def _collect_indexed_product_names() -> List[str]:
+    names = set()
+    trad_engine = st.session_state.get("trad_query_engine")
+    graph_engine = st.session_state.get("graph_query_engine")
+    for engine in (trad_engine, graph_engine):
+        if not engine:
+            continue
+        for product in getattr(engine, "indexed_products", []) or []:
+            name = (product.get("product_name") or "").strip()
+            if name:
+                names.add(name)
+    return sorted(names)
+
+
+def _extract_assistant_turn_summary(turn: Dict[str, Any]) -> str:
+    """Compact assistant-side summary from a stored turn for context grounding."""
+    if not isinstance(turn, dict):
+        return ""
+    if turn.get("type") == "clarification":
+        return (turn.get("assistant_message") or "").strip()
+
+    graph_answer = ((turn.get("graph_rag") or {}).get("answer") or "").strip()
+    trad_answer = ((turn.get("trad_rag") or {}).get("answer") or "").strip()
+    summary = graph_answer or trad_answer
+    if len(summary) > 350:
+        summary = summary[:350] + "..."
+    return summary
+
+
+def _get_last_user_question_from_history() -> str:
+    """Return the most recent resolved or raw user question from history."""
+    for turn in reversed(st.session_state.get("messages", [])):
+        if not isinstance(turn, dict):
+            continue
+        resolved = (turn.get("resolved_question") or "").strip()
+        if resolved:
+            return resolved
+        q = (turn.get("question") or "").strip()
+        if q:
+            return q
+    return ""
+
+
+def _serialize_recent_conversation(max_turns: int = 4) -> str:
+    """Serialize recent turns for lightweight LLM contextualization."""
+    turns = [t for t in st.session_state.get("messages", []) if isinstance(t, dict)]
+    if not turns:
+        return ""
+
+    selected = turns[-max_turns:]
+    lines: List[str] = []
+    for i, turn in enumerate(selected, start=1):
+        question = (turn.get("resolved_question") or turn.get("question") or "").strip()
+        if question:
+            lines.append(f"Turn {i} user: {question}")
+        assistant_summary = _extract_assistant_turn_summary(turn)
+        if assistant_summary:
+            lines.append(f"Turn {i} assistant: {assistant_summary}")
+    return "\n".join(lines).strip()
+
+
+def contextualize_question_with_history(question: str) -> Dict[str, Any]:
+    """Rewrite a follow-up question into a standalone query using recent history."""
+    raw_question = (question or "").strip()
+    if not raw_question:
+        return {
+            "standalone_question": "",
+            "used_history": False,
+            "context_confused": False,
+            "reason": "",
+        }
+
+    history_text = _serialize_recent_conversation(max_turns=4)
+    if not history_text:
+        return {
+            "standalone_question": raw_question,
+            "used_history": False,
+            "context_confused": False,
+            "reason": "",
+        }
+
+    referential_patterns = [
+        r"^\s*(and|also|then|what about|how about)\b",
+        r"\b(it|they|them|those|these|that|this|same|above|previous)\b",
+        r"^\s*(why|how|which ones?)\b",
+    ]
+    looks_referential = any(re.search(p, raw_question, flags=re.IGNORECASE) for p in referential_patterns)
+    fallback_question = raw_question
+    fallback_used_history = False
+    fallback_context_confused = False
+    fallback_reason = ""
+    if looks_referential:
+        prev = _get_last_user_question_from_history()
+        if prev:
+            fallback_question = f"{prev}\nFollow-up focus: {raw_question}"
+            fallback_used_history = True
+            fallback_reason = "Heuristic merge for referential follow-up."
+        else:
+            fallback_context_confused = True
+            fallback_reason = "Referential follow-up without prior context."
+
+    client = _get_llm_client_for_clarification()
+    if not client:
+        return {
+            "standalone_question": fallback_question,
+            "used_history": fallback_used_history,
+            "context_confused": fallback_context_confused,
+            "reason": fallback_reason,
+        }
+
+    prompt = f"""
+You convert follow-up chat questions into standalone questions for retrieval.
+Use conversation context only to resolve references.
+
+Recent conversation:
+{history_text}
+
+Current user message:
+{raw_question}
+
+Return ONLY JSON:
+{{
+  "standalone_question": "single self-contained retrieval-ready question",
+  "used_history": true/false,
+  "context_confused": true/false,
+  "reason": "short phrase"
+}}
+
+Rules:
+- Keep the user's intent and constraints unchanged.
+- Do not answer the question.
+- If already standalone, return it unchanged and used_history=false.
+- If references are ambiguous even with context, keep the question and used_history=false.
+- Set context_confused=true only when referential language cannot be resolved confidently.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You rewrite questions using prior chat context. Output strict JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=240,
+        )
+        parsed = _parse_json_object(resp.choices[0].message.content or "")
+        if not parsed:
+            return {
+                "standalone_question": fallback_question,
+                "used_history": fallback_used_history,
+                "context_confused": fallback_context_confused,
+                "reason": fallback_reason,
+            }
+
+        standalone = (parsed.get("standalone_question") or "").strip() or fallback_question
+        used_history = bool(parsed.get("used_history")) and standalone != raw_question
+        context_confused = bool(parsed.get("context_confused"))
+        if looks_referential and standalone == raw_question and not used_history:
+            context_confused = True
+        reason = (parsed.get("reason") or "").strip()
+        return {
+            "standalone_question": standalone,
+            "used_history": used_history,
+            "context_confused": context_confused,
+            "reason": reason,
+        }
+    except Exception:
+        return {
+            "standalone_question": fallback_question,
+            "used_history": fallback_used_history,
+            "context_confused": fallback_context_confused,
+            "reason": fallback_reason,
+        }
+
+
+def _is_question_specific_enough(question: str) -> bool:
+    """Conservative sufficiency check to avoid over-clarifying good questions."""
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    token_count = len(re.findall(r"\b\w+\b", q))
+    has_domain = bool(
+        re.search(
+            r"\b(hazard|control|risk|cause|consequence|actor|lifecycle|standard|product|maintenance|service)\b",
+            q,
+        )
+    )
+    has_goal = bool(
+        re.search(
+            r"\b(which|what|list|show|find|count|compare|summari[sz]e|identify|top|highest|lowest|average|trend)\b",
+            q,
+        )
+    )
+    has_constraints = bool(
+        re.search(
+            r"\b(for|during|across|by|with|only|above|below|high|medium|low|residual|initial|after|before|per)\b",
+            q,
+        )
+    )
+    return (has_domain and has_goal) or (has_goal and has_constraints) or (token_count >= 9 and (has_domain or has_goal))
+
+
+def _fallback_question_assessment(question: str) -> Dict[str, Any]:
+    q = (question or "").strip()
+    lowered = q.lower()
+    token_count = len(re.findall(r"\b\w+\b", q))
+
+    vague_patterns = [
+        r"^what about\b",
+        r"^tell me\b",
+        r"^explain\b",
+        r"^help\b",
+        r"^details?\b",
+        r"^more\b",
+    ]
+    starts_vague = any(re.search(p, lowered) for p in vague_patterns)
+    has_domain_terms = bool(
+        re.search(
+            r"\b(hazard|control|risk|cause|consequence|actor|lifecycle|standard|product)\b",
+            lowered,
+        )
+    )
+    has_intent_terms = bool(
+        re.search(
+            r"\b(which|what|list|show|find|count|compare|highest|lowest|average|trend|top)\b",
+            lowered,
+        )
+    )
+
+    clearly_specific = _is_question_specific_enough(q)
+    needs_clarification = (not clearly_specific) and (
+        token_count <= 2
+        or (starts_vague and token_count <= 3)
+        or (not has_domain_terms and not has_intent_terms and token_count <= 3)
+    )
+    clarifying_question = (
+        "Could you clarify what you want to analyze: hazards, controls, causes, or consequences, "
+        "and the output format (list, count, or comparison)?"
+    )
+    return {
+        "needs_clarification": needs_clarification,
+        "clarification_required": needs_clarification,
+        "insufficient_info": needs_clarification,
+        "context_confused": False,
+        "missing_fields": [],
+        "clarifying_question": clarifying_question,
+        "rewritten_question": q,
+        "reason": "Question is too broad for precise retrieval." if needs_clarification else "",
+    }
+
+
+def assess_question_clarity(question: str, context_confused: bool = False) -> Dict[str, Any]:
+    """Decide whether a follow-up clarification is required before retrieval."""
+    fallback = _fallback_question_assessment(question)
+    client = _get_llm_client_for_clarification()
+    if not client:
+        if context_confused:
+            fallback.update(
+                {
+                    "needs_clarification": True,
+                    "clarification_required": True,
+                    "insufficient_info": False,
+                    "context_confused": True,
+                    "missing_fields": ["context_reference"],
+                    "clarifying_question": "I might be missing the reference. Which previous hazard/control/result are you referring to?",
+                    "reason": "Context reference is ambiguous.",
+                    "clarification_questions": [
+                        "Which previous hazard, control, or result are you referring to?"
+                    ],
+                }
+            )
+        return fallback
+
+    products = _collect_indexed_product_names()
+    product_hint = ", ".join(products[:12]) if products else "Unknown"
+    prompt = f"""
+You are a query triage assistant for a risk-analysis RAG system.
+Determine whether the user question is specific enough to run retrieval safely.
+
+Question:
+{question}
+
+Indexed products (if relevant):
+{product_hint}
+
+Return ONLY valid JSON:
+{{
+  "needs_clarification": true/false,
+  "clarification_required": true/false,
+  "insufficient_info": true/false,
+  "context_confused": true/false,
+  "missing_fields": ["scope","target_entity","product_scope","output_format","context_reference"],
+  "reason": "short reason",
+  "clarifying_question": "single concise question when clarification is needed; otherwise empty string",
+  "clarification_questions": ["2-3 targeted short questions only when clarification is needed"],
+  "rewritten_question": "clean retrieval-ready rewrite when no clarification is needed; otherwise empty string"
+}}
+
+Rules:
+- Ask clarification ONLY when it is required to proceed with retrieval safely.
+- Required means: unresolved context reference, conflicting constraints, or no usable target/intent.
+- If the question is answerable as-is, set needs_clarification=false and provide rewritten_question.
+- Do not answer the user question itself.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You classify question clarity and output strict JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=220,
+        )
+        parsed = _parse_json_object(resp.choices[0].message.content or "")
+        if not parsed:
+            return fallback
+
+        needs = bool(parsed.get("needs_clarification"))
+        clarification_required = bool(parsed.get("clarification_required"))
+        insufficient_info = bool(parsed.get("insufficient_info"))
+        parsed_context_confused = bool(parsed.get("context_confused"))
+        missing_fields = parsed.get("missing_fields") or []
+        if not isinstance(missing_fields, list):
+            missing_fields = []
+        missing_fields = [str(field).strip() for field in missing_fields if str(field).strip()]
+        clarifying_question = (parsed.get("clarifying_question") or "").strip()
+        clarification_questions = parsed.get("clarification_questions") or []
+        if not isinstance(clarification_questions, list):
+            clarification_questions = []
+        clarification_questions = [
+            str(q).strip()
+            for q in clarification_questions
+            if str(q).strip()
+        ][:3]
+        rewritten_question = (parsed.get("rewritten_question") or "").strip()
+        reason = (parsed.get("reason") or "").strip()
+
+        combined_context_confused = context_confused or parsed_context_confused
+        clearly_specific = _is_question_specific_enough(question)
+
+        # Final conservative policy:
+        # Clarify only when (1) insufficient info OR (2) context is ambiguous.
+        if combined_context_confused:
+            needs = True
+            clarification_required = True
+        elif clarification_required and (insufficient_info or missing_fields) and not clearly_specific:
+            needs = True
+        elif clearly_specific:
+            needs = False
+        else:
+            needs = False
+
+        if needs and not clarifying_question:
+            clarifying_question = fallback["clarifying_question"]
+        if needs and not clarification_questions:
+            clarification_questions = [clarifying_question] if clarifying_question else []
+        if not needs and not rewritten_question:
+            rewritten_question = (question or "").strip()
+        if not needs:
+            missing_fields = []
+            reason = ""
+            clarification_questions = []
+
+        return {
+            "needs_clarification": needs,
+            "clarification_required": clarification_required,
+            "insufficient_info": insufficient_info,
+            "context_confused": combined_context_confused,
+            "missing_fields": missing_fields,
+            "clarifying_question": clarifying_question,
+            "clarification_questions": clarification_questions,
+            "rewritten_question": rewritten_question,
+            "reason": reason,
+        }
+    except Exception:
+        if context_confused:
+            fallback.update(
+                {
+                    "needs_clarification": True,
+                    "clarification_required": True,
+                    "insufficient_info": False,
+                    "context_confused": True,
+                    "missing_fields": ["context_reference"],
+                    "clarifying_question": "I might be missing the reference. Which previous hazard/control/result are you referring to?",
+                    "reason": "Context reference is ambiguous.",
+                    "clarification_questions": [
+                        "Which previous hazard, control, or result are you referring to?"
+                    ],
+                }
+            )
+        return fallback
+
+
+def _fallback_clarification_payload(
+    question: str,
+    assessment: Dict[str, Any],
+) -> Dict[str, Any]:
+    products = _collect_indexed_product_names()
+    missing_fields = assessment.get("missing_fields") or []
+    if not isinstance(missing_fields, list):
+        missing_fields = []
+    missing = {str(field).strip() for field in missing_fields if str(field).strip()}
+
+    questions: List[str] = []
+    if "product_scope" in missing:
+        if products:
+            questions.append("Which product should I focus on?")
+        else:
+            questions.append("Which product should I focus on?")
+    if "target_entity" in missing:
+        questions.append("Do you want hazards, controls, causes, or consequences?")
+    if "output_format" in missing:
+        questions.append("What output do you want: list, count, or comparison?")
+    if "scope" in missing:
+        questions.append("Should I scope by lifecycle phase, severity, actor, or standard?")
+    if "context_reference" in missing:
+        questions.append("Which previous result are you referring to?")
+
+    if not questions:
+        generic = (assessment.get("clarification_questions") or [])
+        if isinstance(generic, list):
+            questions = [str(q).strip() for q in generic if str(q).strip()]
+        if not questions and assessment.get("clarifying_question"):
+            questions = [str(assessment.get("clarifying_question")).strip()]
+        if not questions:
+            questions = [
+                "Which product should I analyze?",
+                "Which hazard or control type should I focus on?",
+                "What output format do you want?"
+            ]
+
+    return {
+        "intro": "To give an exact answer, I need a little more detail.",
+        "clarification_questions": questions[:3],
+        "product_options": products[:5],
+        "reason": (assessment.get("reason") or "").strip(),
+        "status": "incomplete",
+    }
+
+
+def build_targeted_clarification_payload(
+    user_query: str,
+    assessment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Generate 2-3 targeted clarification questions using product metadata."""
+    fallback = _fallback_clarification_payload(user_query, assessment)
+    client = _get_llm_client_for_clarification()
+    if not client:
+        return fallback
+
+    products = _collect_indexed_product_names()
+    product_list = ", ".join(products[:12]) if products else "Unknown"
+    missing_fields = assessment.get("missing_fields") or []
+    if not isinstance(missing_fields, list):
+        missing_fields = []
+    missing_text = ", ".join([str(field) for field in missing_fields if str(field).strip()]) or "unspecified"
+
+    prompt = f"""
+You are a Risk Analysis Assistant.
+The user query is: "{user_query}"
+Our product catalog is: {product_list}
+Missing fields detected by gatekeeper: {missing_text}
+
+Generate a targeted clarification payload to narrow the query safely.
+Return ONLY JSON:
+{{
+  "status": "incomplete",
+  "intro": "one short professional sentence",
+  "clarification_questions": ["2-3 short specific questions"],
+  "product_options": ["0-5 relevant product names from catalog if product scope is missing"],
+  "reason": "short reason"
+}}
+
+Rules:
+- Keep questions concise and directly actionable.
+- Ask at most 3 questions.
+- If product scope is missing, include product options from the catalog.
+- Do not answer the original query.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You generate clarification payloads as strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=260,
+        )
+        parsed = _parse_json_object(resp.choices[0].message.content or "")
+        if not parsed:
+            return fallback
+
+        intro = (parsed.get("intro") or "").strip() or fallback["intro"]
+        reason = (parsed.get("reason") or "").strip() or fallback["reason"]
+
+        questions = parsed.get("clarification_questions") or []
+        if not isinstance(questions, list):
+            questions = []
+        questions = [str(q).strip() for q in questions if str(q).strip()][:3]
+        if not questions:
+            questions = fallback["clarification_questions"]
+
+        product_options = parsed.get("product_options") or []
+        if not isinstance(product_options, list):
+            product_options = []
+        product_options = [str(p).strip() for p in product_options if str(p).strip()]
+        if products:
+            allowed = set(products)
+            product_options = [p for p in product_options if p in allowed]
+        product_options = product_options[:5] if product_options else fallback["product_options"]
+
+        return {
+            "status": "incomplete",
+            "intro": intro,
+            "clarification_questions": questions,
+            "product_options": product_options,
+            "reason": reason,
+        }
+    except Exception:
+        return fallback
+
+
+def format_clarification_message(payload: Dict[str, Any]) -> str:
+    intro = (payload.get("intro") or "Please clarify your request.").strip()
+    questions = payload.get("clarification_questions") or []
+    if not isinstance(questions, list):
+        questions = []
+    questions = [str(q).strip() for q in questions if str(q).strip()][:3]
+    products = payload.get("product_options") or []
+    if not isinstance(products, list):
+        products = []
+    products = [str(p).strip() for p in products if str(p).strip()][:5]
+
+    lines = [intro]
+    if questions:
+        lines.append("")
+        lines.append("Please clarify:")
+        for i, q in enumerate(questions, start=1):
+            lines.append(f"{i}. {q}")
+    if products:
+        lines.append("")
+        lines.append("Available products:")
+        for p in products:
+            lines.append(f"- {p}")
+    return "\n".join(lines).strip()
+
+
+def resolve_clarified_question(original_question: str, clarification_answer: str) -> str:
+    """Merge user clarification back into a retrieval-ready final question."""
+    base = (original_question or "").strip()
+    extra = (clarification_answer or "").strip()
+    if not base:
+        return extra
+    if not extra:
+        return base
+
+    fallback = f"{base}\n\nClarification provided by user: {extra}"
+    client = _get_llm_client_for_clarification()
+    if not client:
+        return fallback
+
+    prompt = f"""
+Combine the original question and user clarification into one retrieval-ready question.
+Preserve exact user intent; do not add new constraints.
+
+Original question:
+{base}
+
+User clarification:
+{extra}
+
+Return ONLY JSON:
+{{
+  "resolved_question": "single final question"
+}}
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You rewrite questions. Output strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=180,
+        )
+        parsed = _parse_json_object(resp.choices[0].message.content or "")
+        resolved = (parsed.get("resolved_question") or "").strip() if parsed else ""
+        return resolved or fallback
+    except Exception:
+        return fallback
+
+
 # ==================== SIDEBAR & DATA LOADING ====================
 
 def render_sidebar():
@@ -706,6 +1344,13 @@ def render_sidebar():
         #     st.metric("Trad RAG", status)
 
         # st.divider()
+        st.toggle(
+            "Clarify ambiguous questions before retrieval",
+            key="clarification_mode",
+        )
+        st.caption("When enabled, the assistant asks one follow-up question if your query is too broad.")
+
+        st.divider()
         st.header("🎨 Legend")
         # Ensure NODE_COLORS is defined globally or imported
         for node_type, color in NODE_COLORS.items():
@@ -831,7 +1476,9 @@ def main():
     chat_container = st.container()
 
     # Input Area (Fixed at bottom)
-    if prompt := st.chat_input("Ask a complex question about hazards..."):
+    pending = st.session_state.get("pending_clarification")
+    placeholder = "Answer the clarification so I can run the analysis..." if pending else "Ask a complex question about hazards..."
+    if prompt := st.chat_input(placeholder):
         process_user_query(prompt)
 
     # Render History inside the container
@@ -873,18 +1520,106 @@ def process_user_query(question: str):
     with st.chat_message("user"):
         st.markdown(question)
 
-    results = {'question': question, 'graph_rag': None, 'trad_rag': None}
+    pending = st.session_state.get("pending_clarification")
+    effective_question = question
+    clarification_reason = ""
+    clarification_context = None
+    conversation_context_applied = ""
+    conversation_context_reason = ""
+    context_confused = False
+
+    # If the previous turn asked for clarification, treat this user turn as the clarifying answer.
+    if pending and pending.get("original_question"):
+        clarification_context = pending
+        effective_question = resolve_clarified_question(
+            pending.get("base_question_for_resolution", pending.get("original_question", "")),
+            question,
+        )
+        clarification_reason = pending.get("reason", "")
+        st.session_state.pending_clarification = None
+    elif st.session_state.get("clarification_mode", True):
+        contextualized = contextualize_question_with_history(question)
+        normalized_question = contextualized.get("standalone_question") or question
+        context_confused = bool(contextualized.get("context_confused"))
+        if contextualized.get("used_history") and normalized_question.strip() != question.strip():
+            conversation_context_applied = normalized_question
+            conversation_context_reason = contextualized.get("reason", "")
+
+        assessment = assess_question_clarity(
+            normalized_question,
+            context_confused=context_confused,
+        )
+        if assessment.get("needs_clarification"):
+            clarification_payload = build_targeted_clarification_payload(
+                normalized_question,
+                assessment,
+            )
+            follow_up = format_clarification_message(clarification_payload)
+            reason = clarification_payload.get("reason", "") or assessment.get("reason", "")
+            clarification_questions = clarification_payload.get("clarification_questions") or []
+            product_options = clarification_payload.get("product_options") or []
+
+            with st.chat_message("assistant"):
+                st.info(follow_up)
+                if reason:
+                    st.caption(f"Why this follow-up: {reason}")
+                if conversation_context_applied:
+                    st.caption(f"Conversation-aware interpretation: {conversation_context_applied}")
+
+            st.session_state.pending_clarification = {
+                "original_question": question,
+                "base_question_for_resolution": normalized_question,
+                "clarifying_question": follow_up,
+                "clarification_questions": clarification_questions,
+                "product_options": product_options,
+                "reason": reason,
+            }
+            st.session_state.messages.append(
+                {
+                    "type": "clarification",
+                    "question": question,
+                    "contextualized_question": conversation_context_applied,
+                    "assistant_message": follow_up,
+                    "clarification_questions": clarification_questions,
+                    "product_options": product_options,
+                    "reason": reason,
+                    "graph_rag": None,
+                    "trad_rag": None,
+                }
+            )
+            st.rerun()
+            return
+
+        effective_question = assessment.get("rewritten_question") or normalized_question
+
+    results = {
+        'type': 'analysis',
+        'question': question,
+        'resolved_question': effective_question if effective_question.strip() != question.strip() else '',
+        'contextualized_question': conversation_context_applied,
+        'contextualized_reason': conversation_context_reason,
+        'clarification_reason': clarification_reason,
+        'clarified_from': clarification_context.get("original_question", "") if clarification_context else "",
+        'graph_rag': None,
+        'trad_rag': None
+    }
 
     # >>> SHOW PROCESSING STATUS INSIDE ASSISTANT BLOCK <<<
     with st.chat_message("assistant"):
         with st.status("Running dual-engine analysis...", expanded=True) as status:
+            if clarification_context:
+                status.write("🧭 Clarification received. Running with resolved question.")
+            elif effective_question.strip() != question.strip():
+                status.write("🧭 Rewriting question for retrieval precision.")
+            if conversation_context_applied:
+                status.write("🧠 Using recent conversation context to resolve references.")
 
             # --- Graph RAG Execution ---
             if st.session_state.graph_rag_loaded:
                 status.write("🕸️ Querying Knowledge Graph...")
                 try:
                     cypher, raw_results, answer, chunks = st.session_state.graph_query_engine.query(
-                        question)
+                        effective_question)
                     nodes, rels, viz_query = fetch_subgraph_for_query_results(
                         st.session_state.graph_query_engine, cypher)
                     results['graph_rag'] = {
@@ -903,7 +1638,7 @@ def process_user_query(question: str):
                 status.write("📚 Searching Vector Embeddings...")
                 try:
                     debug, hits, answer = st.session_state.trad_query_engine.query(
-                        question)
+                        effective_question)
                     results['trad_rag'] = {
                         'answer': answer,
                         'debug': debug,
@@ -922,6 +1657,21 @@ def process_user_query(question: str):
 
 def render_comparison_result(results: Dict):
     """Render the side-by-side comparison block inside the chat."""
+    if results.get("type") == "clarification":
+        st.info(results.get("assistant_message", "Could you clarify your question?"))
+        if results.get("reason"):
+            st.caption(f"Why this follow-up: {results['reason']}")
+        if results.get("contextualized_question"):
+            st.caption(f"Conversation-aware interpretation: {results['contextualized_question']}")
+        return
+
+    contextualized_question = (results.get("contextualized_question") or "").strip()
+    if contextualized_question:
+        st.caption(f"Conversation-aware interpretation: {contextualized_question}")
+
+    resolved_question = (results.get("resolved_question") or "").strip()
+    if resolved_question:
+        st.caption(f"Resolved query used: {resolved_question}")
 
     col1, col2 = st.columns(2)
 
